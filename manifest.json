@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Moto24 พรบ Auto-Fill",
+  "version": "0.1.0",
+  "description": "กรอกข้อมูล พรบ อัตโนมัติจากระบบ Moto24",
+  "permissions": ["storage", "scripting", "tabs"],
+  "host_permissions": [
+    "https://moto24.roodee.io/dummy-prb/*",
+    "http://localhost:3000/dummy-prb/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "externally_connectable": {
+    "matches": [
+      "https://moto24.roodee.io/*",
+      "http://localhost:3000/*"
+    ]
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}
