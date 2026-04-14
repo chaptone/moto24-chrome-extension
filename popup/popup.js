@@ -17,7 +17,9 @@ function render(obj) {
   const cfg = CONFIG[cur.state] ?? CONFIG.idle;
   el.className = `state ${cfg.cls}`;
   const msg = cur.state === "error" && cur.message ? cur.message : cfg.msg;
-  el.innerHTML = `<div class="label">${cfg.label}</div><div class="msg">${msg}</div>`;
+  el.innerHTML = '<div class="label"></div><div class="msg"></div>';
+  el.querySelector(".label").textContent = cfg.label;
+  el.querySelector(".msg").textContent = msg;
 }
 
 chrome.storage.session.get().then(render);
