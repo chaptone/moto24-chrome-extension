@@ -17,5 +17,5 @@ Chrome Extension ที่รับสัญญาจาก moto24 `/registratio
 
 ## Design & Plan
 
-- Design: /Users/rakkanj/dev/moto24/docs/superpowers/specs/2026-04-13-prb-autofill-chrome-extension-design.md
-- Plan: /Users/rakkanj/dev/moto24/docs/superpowers/plans/2026-04-14-prb-autofill-chrome-extension.md
+- Design: `docs/superpowers/specs/2026-04-13-prb-autofill-chrome-extension-design.md` (in the moto24 repo)
+- Plan: `docs/superpowers/plans/2026-04-14-prb-autofill-chrome-extension.md` (in the moto24 repo)
