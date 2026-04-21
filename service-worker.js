@@ -131,13 +131,18 @@ async function driveNextStep(tabId) {
 
     case "form": {
       await setState(STATES.FILLING);
-      const { [DATA_KEY]: data } = await chrome.storage.session.get(DATA_KEY);
-      await chrome.scripting.executeScript({
+      const [{ result: fillResult }] = await chrome.scripting.executeScript({
         target: { tabId },
         files: ["scripts/fill-form.js"],
       });
-      // Fill-form reads data from chrome.storage.session itself.
-      await setState(STATES.DONE);
+      // fill-form.js returns "filled:N+M" on success, "no-data" | "no-inputs" on failure.
+      if (typeof fillResult === "string" && fillResult.startsWith("filled:")) {
+        await setState(STATES.DONE, { fillResult });
+      } else {
+        await setState(STATES.ERROR, {
+          message: `กรอกฟอร์มไม่สำเร็จ (${fillResult ?? "unknown"})`,
+        });
+      }
       break;
     }
 
