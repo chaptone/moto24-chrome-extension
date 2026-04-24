@@ -1,25 +1,61 @@
-// popup.js — renders state from chrome.storage.session.
+// popup.js — renders PRB autofill state from chrome.storage.session.
 
-const CONFIG = {
+const STATE_CONFIG = {
   idle: { cls: "idle", label: "พร้อมใช้งาน", msg: "รอรับคำสั่งจากหน้า moto24" },
-  navigating: { cls: "working", label: "กำลังเปิดเว็บ…", msg: "โหลดเว็บ พรบ" },
-  login_required: { cls: "wait", label: "กรุณา login", msg: "กรุณาเข้าสู่ระบบที่เว็บ พรบ ก่อน" },
-  selecting_menu: { cls: "working", label: "กำลังเลือกเมนู…", msg: "คลิก ต่อ / ซื้อ พรบ" },
-  filling: { cls: "working", label: "กำลังกรอกข้อมูล…", msg: "กรอก form ตามข้อมูลสัญญา" },
+  working: { cls: "working", label: "กำลังกรอกข้อมูล…", msg: "กำลังเปิดแท็บและกรอก form" },
+  wait_login: { cls: "wait_login", label: "กรุณา login", msg: "กรุณา login เข้า RVP ก่อน" },
   done: { cls: "done", label: "กรอกเสร็จ", msg: "กรุณาตรวจสอบข้อมูลแล้วกด submit" },
   error: { cls: "error", label: "เกิดข้อผิดพลาด", msg: "ลองรีเฟรช หรือกรอกเอง" },
 };
 
-const el = document.getElementById("state");
+const stateEl = document.getElementById("state");
+const filledSection = document.getElementById("filled-section");
+const filledList = document.getElementById("filled-list");
+const skippedSection = document.getElementById("skipped-section");
+const skippedList = document.getElementById("skipped-list");
 
 function render(obj) {
   const cur = obj?.prbState ?? { state: "idle" };
-  const cfg = CONFIG[cur.state] ?? CONFIG.idle;
-  el.className = `state ${cfg.cls}`;
-  const msg = cur.state === "error" && cur.message ? cur.message : cfg.msg;
-  el.innerHTML = '<div class="label"></div><div class="msg"></div>';
-  el.querySelector(".label").textContent = cfg.label;
-  el.querySelector(".msg").textContent = msg;
+  const cfg = STATE_CONFIG[cur.state] ?? STATE_CONFIG.idle;
+
+  stateEl.className = `state ${cfg.cls}`;
+  stateEl.innerHTML = '<div class="label"></div><div class="msg"></div>';
+  stateEl.querySelector(".label").textContent = cfg.label;
+  stateEl.querySelector(".msg").textContent =
+    cur.state === "error" && cur.error ? cur.error : cfg.msg;
+
+  renderList(filledSection, filledList, "filled", cur.filled);
+  renderList(skippedSection, skippedList, "skipped", cur.skipped);
+}
+
+function renderList(section, ul, cls, items) {
+  if (!items || items.length === 0) {
+    section.hidden = true;
+    ul.innerHTML = "";
+    return;
+  }
+  section.hidden = false;
+  ul.innerHTML = items.map((item) => renderItem(cls, item)).join("");
+}
+
+function renderItem(cls, item) {
+  // "filled" items are bare field-name strings; "skipped" items are objects.
+  if (cls === "filled") {
+    const label = FIELD_LABELS[item] ?? item;
+    return `<li class="filled">${escapeHtml(label)}</li>`;
+  }
+  const label = FIELD_LABELS[item.field] ?? item.field;
+  const reason = item.reason ?? "";
+  const valueHint = item.value ? ` <span class="skipped-value">(BC: ${escapeHtml(item.value)})</span>` : "";
+  return `<li class="skipped">${escapeHtml(label)} — ${escapeHtml(reason)}${valueHint}</li>`;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 chrome.storage.session.get().then(render);

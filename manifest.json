@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Moto24 พรบ Auto-Fill",
-  "version": "0.1.0",
-  "description": "กรอกข้อมูล พรบ อัตโนมัติจากระบบ Moto24",
+  "version": "0.3.1",
+  "description": "กรอกข้อมูล พรบ อัตโนมัติจากระบบ Moto24 (รองรับเว็บ RVP จริง)",
   "permissions": ["storage", "scripting", "tabs"],
   "host_permissions": [
+    "https://epolicy4.rvp.co.th/*",
     "https://moto24.roodee.io/dummy-prb/*",
     "http://localhost:3000/dummy-prb/*"
   ],
@@ -13,8 +14,8 @@
   },
   "externally_connectable": {
     "matches": [
-      "https://moto24.roodee.io/registration-tracking*",
-      "http://localhost:3000/registration-tracking*"
+      "https://moto24.roodee.io/*",
+      "http://localhost:3000/*"
     ]
   },
   "action": {

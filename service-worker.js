@@ -1,43 +1,38 @@
 // service-worker.js — Moto24 พรบ Auto-Fill
 //
-// State machine:
-//   idle → navigating → detect_page → {login_required | selecting_menu | filling} → done/error → idle
+// Flow (linear, no chrome.tabs.onUpdated driving):
+//   onMessageExternal(FILL_PRB) →
+//   open tab → wait for 'complete' → detect-page classify →
+//     if "form":  inject run-prb-flow → return its PRBResult
+//     if "login": return abort error "login required"
+//     else:       return abort error "URL unexpected"
 //
-// State lives in chrome.storage.session (ephemeral, cleared on browser close).
+// Popup state persists via chrome.storage.session (schema unchanged).
+
+importScripts("scripts/run-prb-flow.js");
 
 const STATE_KEY = "prbState";
-const DATA_KEY = "prbData";
-const TAB_KEY = "prbTabId";
+
+// ---- Popup state helpers --------------------------------------------------
 
 const STATES = {
   IDLE: "idle",
-  NAVIGATING: "navigating",
-  LOGIN_REQUIRED: "login_required",
-  SELECTING_MENU: "selecting_menu",
-  FILLING: "filling",
+  WORKING: "working",
   DONE: "done",
   ERROR: "error",
+  WAIT_LOGIN: "wait_login",
 };
-
-// ---- State helpers --------------------------------------------------------
 
 async function setState(state, extra = {}) {
   await chrome.storage.session.set({ [STATE_KEY]: { state, ...extra, at: Date.now() } });
   updateBadge(state);
 }
 
-async function getState() {
-  const obj = await chrome.storage.session.get(STATE_KEY);
-  return obj[STATE_KEY] ?? { state: STATES.IDLE };
-}
-
 function updateBadge(state) {
   const map = {
     [STATES.IDLE]: { text: "", color: "#666" },
-    [STATES.NAVIGATING]: { text: "…", color: "#0066cc" },
-    [STATES.LOGIN_REQUIRED]: { text: "!", color: "#eab308" },
-    [STATES.SELECTING_MENU]: { text: "…", color: "#0066cc" },
-    [STATES.FILLING]: { text: "…", color: "#0066cc" },
+    [STATES.WORKING]: { text: "…", color: "#0066cc" },
+    [STATES.WAIT_LOGIN]: { text: "!", color: "#eab308" },
     [STATES.DONE]: { text: "✓", color: "#16a34a" },
     [STATES.ERROR]: { text: "×", color: "#dc2626" },
   };
@@ -46,7 +41,7 @@ function updateBadge(state) {
   chrome.action.setBadgeBackgroundColor({ color: cfg.color });
 }
 
-// ---- Entry point: message from moto24 web page ----------------------------
+// ---- Entry point: FILL_PRB message from moto24 ----------------------------
 
 chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
   (async () => {
@@ -55,171 +50,120 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         sendResponse({ success: false, error: "Unknown message type" });
         return;
       }
-      if (!message.data?.chassisNumber) {
+      const payload = message.data;
+      if (!payload?.chassisNumber) {
         sendResponse({ success: false, error: "Missing required field: chassisNumber" });
         return;
       }
 
-      // Store data + kick off navigation
-      await chrome.storage.session.set({ [DATA_KEY]: message.data });
-      await setState(STATES.NAVIGATING);
+      await setState(STATES.WORKING);
 
-      const targetUrl = getTargetUrl(sender.url);
+      const targetUrl = getTargetUrl();
       const tab = await chrome.tabs.create({ url: targetUrl, active: true });
-      await chrome.storage.session.set({ [TAB_KEY]: tab.id });
+      const tabId = tab.id;
+      if (typeof tabId !== "number") {
+        await setState(STATES.ERROR, { error: "ไม่สามารถเปิดแท็บใหม่" });
+        sendResponse({ success: false, error: "ไม่สามารถเปิดแท็บใหม่" });
+        return;
+      }
 
-      sendResponse({ success: true, tabId: tab.id });
+      // Wait for the tab to finish loading.
+      await waitForTabComplete(tabId, 15000);
+
+      // Detect what page landed.
+      const [detectResult] = await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["scripts/detect-page.js"],
+      });
+      const pageType = detectResult?.result;
+
+      if (pageType === "login") {
+        await setState(STATES.WAIT_LOGIN, { error: "กรุณา login เข้า RVP ก่อน" });
+        sendResponse({ success: false, error: "กรุณา login เข้า RVP ก่อน แล้วคลิกอีกครั้ง" });
+        return;
+      }
+      if (pageType !== "form") {
+        const err = "URL ไม่ถูกต้อง — RVP อาจเปลี่ยนหน้า";
+        await setState(STATES.ERROR, { error: err });
+        sendResponse({ success: false, error: err });
+        return;
+      }
+
+      // Inject run-prb-flow and await its result.
+      let injectionResult;
+      try {
+        const [injection] = await chrome.scripting.executeScript({
+          target: { tabId },
+          // eslint-disable-next-line no-undef
+          func: runPRBFlow,
+          args: [payload],
+          // MAIN world so runPRBFlow sees the page's window.jQuery; otherwise
+          // Select2's change handler falls through to the native-event path.
+          world: "MAIN",
+        });
+        injectionResult = injection?.result;
+      } catch (err) {
+        const msg = "ไม่สามารถ inject สคริปต์";
+        await setState(STATES.ERROR, { error: msg, detail: String(err) });
+        sendResponse({ success: false, error: msg });
+        return;
+      }
+
+      if (!injectionResult) {
+        const msg = "ไม่ได้รับผลลัพธ์จากสคริปต์";
+        await setState(STATES.ERROR, { error: msg });
+        sendResponse({ success: false, error: msg });
+        return;
+      }
+
+      if (injectionResult.success) {
+        await setState(STATES.DONE, {
+          filled: injectionResult.filled,
+          skipped: injectionResult.skipped,
+        });
+      } else {
+        await setState(STATES.ERROR, { error: injectionResult.error });
+      }
+      sendResponse(injectionResult);
     } catch (err) {
-      await setState(STATES.ERROR, { message: String(err) });
-      sendResponse({ success: false, error: String(err) });
+      const msg = String(err);
+      await setState(STATES.ERROR, { error: msg });
+      sendResponse({ success: false, error: msg });
     }
   })();
   return true; // async sendResponse
 });
 
-// Map moto24 origin → dummy-prb origin on the same host.
-function getTargetUrl(senderUrl) {
-  try {
-    const u = new URL(senderUrl);
-    return `${u.origin}/dummy-prb/login`;
-  } catch {
-    return "https://moto24.roodee.io/dummy-prb/login";
-  }
+// ---- Helpers --------------------------------------------------------------
+
+// Always target the real RVP form. For offline dev against /dummy-prb/,
+// temporarily return `${new URL(senderUrl).origin}/dummy-prb/form` here
+// (and re-add the senderUrl arg at the call site).
+function getTargetUrl() {
+  return "https://epolicy4.rvp.co.th/Policy/New";
 }
 
-// ---- Per-navigation driver ------------------------------------------------
+function waitForTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("tab load timeout"));
+    }, timeoutMs);
 
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (changeInfo.status !== "complete") return;
-
-  const { [TAB_KEY]: trackedTabId } = await chrome.storage.session.get(TAB_KEY);
-  if (tabId !== trackedTabId) return;
-
-  const current = await getState();
-  if (current.state === STATES.DONE || current.state === STATES.IDLE) return;
-
-  await driveNextStep(tabId);
-});
-
-// Clear state when the tracked tab closes.
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const { [TAB_KEY]: trackedTabId } = await chrome.storage.session.get(TAB_KEY);
-  if (tabId === trackedTabId) {
-    await chrome.storage.session.remove([TAB_KEY, DATA_KEY]);
-    await setState(STATES.IDLE);
-  }
-});
-
-async function driveNextStep(tabId) {
-  const [{ result: pageType }] = await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["scripts/detect-page.js"],
+    function listener(updatedTabId, changeInfo) {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status !== "complete") return;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve();
+    }
+    chrome.tabs.onUpdated.addListener(listener);
   });
-
-  switch (pageType) {
-    case "login":
-      await setState(STATES.LOGIN_REQUIRED);
-      break;
-
-    case "menu":
-      await setState(STATES.SELECTING_MENU);
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["scripts/click-menu.js"],
-      });
-      break;
-
-    case "form": {
-      await setState(STATES.FILLING);
-      const { [DATA_KEY]: data } = await chrome.storage.session.get(DATA_KEY);
-      if (!data) {
-        await setState(STATES.ERROR, { message: "ไม่พบข้อมูลสัญญาใน session" });
-        break;
-      }
-      // Pass data as an arg to the injected function. This avoids having the
-      // content script reach into chrome.storage from the page context, which
-      // was returning undefined in testing.
-      const [injection] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: fillFormInPage,
-        args: [data],
-      });
-      const fillResult = injection?.result;
-      if (typeof fillResult === "string" && fillResult.startsWith("filled:")) {
-        await setState(STATES.DONE, { fillResult });
-      } else {
-        await setState(STATES.ERROR, {
-          message: `กรอกฟอร์มไม่สำเร็จ (${fillResult ?? "unknown"})`,
-        });
-      }
-      break;
-    }
-
-    default:
-      // Unknown page — leave state as-is; the user can navigate manually.
-      break;
-  }
 }
 
-// On service worker wake-up, reset badge from persisted state.
+// ---- Startup --------------------------------------------------------------
+
 chrome.runtime.onStartup.addListener(async () => {
-  const { state } = await getState();
-  updateBadge(state);
+  const obj = await chrome.storage.session.get(STATE_KEY);
+  updateBadge(obj[STATE_KEY]?.state ?? STATES.IDLE);
 });
-
-// ---- Injected into the page via chrome.scripting.executeScript({ func }) --
-//
-// Runs in the page's isolated world. Self-contained — no references to outer
-// scope (Chrome serializes the function body). Receives form data as an arg
-// so it doesn't need chrome.storage access from the content-script context.
-async function fillFormInPage(data) {
-  // Wait up to 2s for the first input to appear (handles late mount after
-  // Next.js client-side navigation).
-  let ready = false;
-  for (let i = 0; i < 20; i++) {
-    if (document.querySelector('input[name="chassisNumber"]')) {
-      ready = true;
-      break;
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  if (!ready) return "no-inputs";
-
-  const mapping = {
-    chassisNumber: data.chassisNumber,
-    engineNumber: data.engineNumber,
-    productMakeDesc: data.productMakeDesc,
-    productModelDesc: data.productModelDesc,
-    customerName: data.customerName,
-  };
-
-  function setInputValue(el, value) {
-    const proto = Object.getPrototypeOf(el);
-    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-    if (setter) setter.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-
-  function fillAll() {
-    let filled = 0;
-    for (const [name, value] of Object.entries(mapping)) {
-      const input = document.querySelector(`input[name="${name}"]`);
-      if (input && value != null && input.value !== String(value)) {
-        setInputValue(input, String(value));
-        filled++;
-      }
-    }
-    return filled;
-  }
-
-  const firstPass = fillAll();
-  // Re-apply after 400ms in case React hydration wipes uncontrolled input
-  // values. fillAll skips inputs whose value already matches, so this is a
-  // no-op if nothing changed.
-  await new Promise((r) => setTimeout(r, 400));
-  const secondPass = fillAll();
-
-  return `filled:${firstPass}+${secondPass}`;
-}
