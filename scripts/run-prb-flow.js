@@ -1,4 +1,4 @@
-// scripts/run-prb-flow.js — Moto24 พรบ Auto-Fill
+// scripts/run-prb-flow.js — Moto24 พรบ Auto-Fill (v0.4.0 — P3 widening)
 //
 // This module exports the `runPRBFlow` page-function that the service worker
 // passes to chrome.scripting.executeScript({func}). It runs inside the RVP
@@ -10,12 +10,24 @@
 
 /**
  * @typedef {Object} PRBPayload
- * @property {string} chassisNumber                Required.
- * @property {string|null} customerPrefix          RVP Prefix value (e.g. "นาย").
+ * @property {string} chassisNumber
+ * @property {string|null} marqueValue
+ * @property {string|null} carColorValue
+ * @property {string|null} carSize
+ * @property {string|null} carTypeValue
+ * @property {string|null} customerPrefix
  * @property {string|null} customerFirstName
  * @property {string|null} customerLastName
- * @property {string|null} marqueValue             RVP MARQUE value (e.g. "ฮอนด้า").
- * @property {string|null} productModelDesc        Reference only — never filled.
+ * @property {string|null} cardId
+ * @property {string|null} cardTypeValue
+ * @property {string|null} birthdate
+ * @property {("01"|"02"|null)} nationType
+ * @property {string|null} nationalityOTH
+ * @property {string|null} address
+ * @property {string|null} changwatCode
+ * @property {string|null} amphurName
+ * @property {string|null} tumbolName
+ * @property {string|null} zipcode
  */
 
 /**
@@ -45,36 +57,9 @@ async function runPRBFlow(payload) {
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // --- 1. Dismiss PDPA modal if present ---------------------------------
-  for (let i = 0; i < 20; i++) {
-    const modal = document.querySelector("#ModalStaticBackdrop");
-    if (!modal) break;
-    const img = document.querySelector("#imgEvent img, #imgEvent > img");
-    if (img) img.click();
-    await sleep(100);
-  }
-  // At this point the modal should be gone. If not, we proceed anyway —
-  // the form fields may still be reachable underneath on some pages.
+  // ── helpers ────────────────────────────────────────────────────────────
 
-  // --- 2. Wait for form ready -------------------------------------------
-  let formReady = false;
-  for (let i = 0; i < 50; i++) {
-    if (document.querySelector("#MARQUE") && document.querySelector("#CarTankNo")) {
-      formReady = true;
-      break;
-    }
-    await sleep(100);
-  }
-  if (!formReady) {
-    return {
-      success: false,
-      error: "RVP อาจเปลี่ยนโครงสร้างหน้าเว็บ",
-    };
-  }
-
-  // --- 3. Fill fields (best-effort) --------------------------------------
-  // Native setter trick for plain textboxes.
-  function setTextboxValue(el, value) {
+  function setText(el, value) {
     const proto = Object.getPrototypeOf(el);
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
     if (setter) setter.call(el, value);
@@ -83,113 +68,287 @@ async function runPRBFlow(payload) {
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  // Select2-compat: set .value then trigger change via jQuery ONCE.
-  // jQuery-missing warning is recorded at most once per fill (dedup).
-  let jqueryWarned = false;
-  function setSelectValue(el, value) {
+  function setSelectViaJQuery(el, value) {
     el.value = value;
     if (window.jQuery) {
       window.jQuery(el).trigger("change");
     } else {
-      // Fallback: native change. Less reliable on Select2 but the dummy
-      // site uses plain <select> so it works there.
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      if (!jqueryWarned) {
-        skipped.push({
-          field: "_environment",
-          reason: "jQuery ไม่พบในหน้านี้ (ใช้ native event แทน)",
-        });
-        jqueryWarned = true;
-      }
     }
   }
 
-  // a. chassisNumber (required — hard-fail if setting fails)
-  const chassisEl = document.querySelector("#CarTankNo");
-  if (chassisEl) {
-    setTextboxValue(chassisEl, payload.chassisNumber);
-    filled.push("chassisNumber");
-  } else {
+  function setRadio(name, value) {
+    const el = document.querySelector(`input[name="${name}"][value="${value}"]`);
+    if (el) el.click();
+  }
+
+  async function dismissPDPAModalIfPresent() {
+    for (let i = 0; i < 20; i++) {
+      const modal = document.querySelector("#ModalStaticBackdrop");
+      if (!modal) break;
+      const img = document.querySelector("#imgEvent img, #imgEvent > img");
+      if (img) img.click();
+      await sleep(100);
+    }
+  }
+
+  async function waitForFormReady() {
+    for (let i = 0; i < 50; i++) {
+      if (document.querySelector("#MARQUE") && document.querySelector("#CarTankNo")) return true;
+      await sleep(100);
+    }
+    return false;
+  }
+
+  // Polls a select for an option whose visible text matches targetName.
+  // Returns the option's `value` once found, or null on timeout / definite miss.
+  async function waitAndLookup(selector, targetName, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const sel = document.querySelector(selector);
+      if (sel && sel.options.length > 1) {
+        const match = Array.from(sel.options).find(
+          (o) => o.text.trim() === targetName.trim()
+        );
+        if (match) return match.value;
+        // Heuristic: if the select is well-populated but our name isn't there,
+        // it's a definitive miss — don't waste the rest of the timeout.
+        if (sel.options.length > 5) return null;
+      }
+      await sleep(100);
+    }
+    return null;
+  }
+
+  // ── 1. Dismiss PDPA + wait for form ────────────────────────────────────
+
+  await dismissPDPAModalIfPresent();
+  const ready = await waitForFormReady();
+  if (!ready) return { success: false, error: "RVP อาจเปลี่ยนโครงสร้างหน้าเว็บ" };
+
+  // Chassis is the only true required field. If the selector is missing the
+  // form layout has changed beyond what we can recover from.
+  if (!document.querySelector("#CarTankNo")) {
     return { success: false, error: "ไม่พบช่องเลขตัวถัง (#CarTankNo)" };
   }
 
-  // b. customerPrefix
-  if (payload.customerPrefix !== null) {
-    const prefixEl = document.querySelector("#Prefix");
-    if (prefixEl) {
-      setSelectValue(prefixEl, payload.customerPrefix);
-      filled.push("customerPrefix");
-    } else {
-      skipped.push({ field: "customerPrefix", reason: "ไม่พบช่องคำนำหน้า (#Prefix)" });
+  // ── 2. Simple non-cascade fields (each isolated) ───────────────────────
+
+  // Order matters — RVP triggers reactive resets between fields:
+  //   • Setting #MARQUE fires an AJAX cascade that repopulates #CarModel
+  //     options AND resets #CarColor to "". Mark cascadeAfter:true to gate
+  //     the loop on cascade completion before continuing.
+  //   • Setting #CarType wipes #CarSize. Verified live 2026-04-26.
+  //     → CarType MUST come before CarSize.
+  // Verified live in real RVP /Policy/New that this order keeps all values.
+  const SIMPLE_FIELDS = [
+    { key: "chassisNumber",     selector: "#CarTankNo", setter: setText },
+    { key: "marqueValue",       selector: "#MARQUE",    setter: setSelectViaJQuery, cascadeAfter: true },
+    { key: "carColorValue",     selector: "#CarColor",  setter: setSelectViaJQuery },
+    { key: "carTypeValue",      selector: "#CarType",   setter: setSelectViaJQuery },
+    { key: "carSize",           selector: "#CarSize",   setter: setText },
+    { key: "customerPrefix",    selector: "#Prefix",    setter: setSelectViaJQuery },
+    { key: "customerFirstName", selector: "#Name",      setter: setText },
+    { key: "customerLastName",  selector: "#Lname",     setter: setText },
+    { key: "customerPhone",     selector: "#Tel",       setter: setText },
+    { key: "cardId",            selector: "#CardID",    setter: setText },
+    { key: "cardTypeValue",     selector: "#CardType",  setter: setSelectViaJQuery },
+    { key: "birthdate",         selector: "#Birthdate", setter: setText },
+    { key: "address",           selector: "#Address",   setter: setText },
+    // NB: zipcode is set AFTER the address cascade, not here. Selecting a
+    // Tumbol auto-populates #Zipcode with the tumbol's default zip — which
+    // overrides BC's actual mailing zip if we set it earlier. See post-cascade
+    // block below.
+  ];
+
+  async function waitForCarModelCascade(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const cm = document.querySelector("#CarModel");
+      if (cm && cm.options.length > 1) return true;
+      await sleep(50);
     }
-  } else {
-    skipped.push({
-      field: "customerPrefix",
-      reason: "ไม่พบคำนำหน้าที่รองรับในข้อมูลลูกค้า",
-    });
+    return false;
   }
 
-  // c. customerFirstName
-  if (payload.customerFirstName !== null) {
-    const nameEl = document.querySelector("#Name");
-    if (nameEl) {
-      setTextboxValue(nameEl, payload.customerFirstName);
-      filled.push("customerFirstName");
-    } else {
-      skipped.push({ field: "customerFirstName", reason: "ไม่พบช่องชื่อ (#Name)" });
-    }
-  } else {
-    skipped.push({ field: "customerFirstName", reason: "ไม่มีข้อมูลชื่อ" });
-  }
+  // Records simple-fields that PASSED their immediate verify, so the
+  // end-of-flow re-verify pass can catch any cross-field wipes (e.g. setting
+  // #CarType wiping #CarSize). Map: key → { selector, expected }.
+  const filledExpected = new Map();
 
-  // d. customerLastName
-  if (payload.customerLastName !== null) {
-    const lnameEl = document.querySelector("#Lname");
-    if (lnameEl) {
-      setTextboxValue(lnameEl, payload.customerLastName);
-      filled.push("customerLastName");
-    } else {
-      skipped.push({ field: "customerLastName", reason: "ไม่พบช่องนามสกุล (#Lname)" });
-    }
-  } else {
-    skipped.push({ field: "customerLastName", reason: "ไม่มีข้อมูลนามสกุล" });
-  }
-
-  // e. marqueValue
-  let marqueWasSet = false;
-  if (payload.marqueValue !== null) {
-    const marqueEl = document.querySelector("#MARQUE");
-    if (marqueEl) {
-      setSelectValue(marqueEl, payload.marqueValue);
-      filled.push("marqueValue");
-      marqueWasSet = true;
-    } else {
-      skipped.push({ field: "marqueValue", reason: "ไม่พบช่องยี่ห้อรถ (#MARQUE)" });
-    }
-  } else {
-    skipped.push({ field: "marqueValue", reason: "ไม่มีในตารางแปลงยี่ห้อ" });
-  }
-
-  // f. productModelDesc — always skipped, with BC value as reference
-  skipped.push({
-    field: "productModelDesc",
-    value: payload.productModelDesc ?? undefined,
-    reason: "เลือกเองในรายการ",
-  });
-
-  // --- 4. Wait for CarModel cascade (only if MARQUE was set) ------------
-  if (marqueWasSet) {
-    const carModelEl = document.querySelector("#CarModel");
-    if (carModelEl) {
-      for (let i = 0; i < 30; i++) {
-        if (carModelEl.options.length > 1) break;
-        await sleep(100);
+  for (const f of SIMPLE_FIELDS) {
+    try {
+      const value = payload[f.key];
+      if (value == null) {
+        skipped.push({ field: f.key, reason: "no_data" });
+        continue;
       }
-      // Timeout is NOT an error — extension still reports success.
+      const el = document.querySelector(f.selector);
+      if (!el) {
+        skipped.push({ field: f.key, reason: "selector_missing" });
+        continue;
+      }
+      f.setter(el, value);
+      // Immediate verify — catches direct silent rejection (e.g. setting an
+      // unknown <option> on a <select> reverts to "" without throwing).
+      if (el.value !== String(value)) {
+        skipped.push({
+          field: f.key,
+          value: String(value),
+          reason: "value_did_not_take",
+        });
+        continue;
+      }
+      filled.push(f.key);
+      filledExpected.set(f.key, { selector: f.selector, expected: String(value) });
+      if (f.cascadeAfter) {
+        // Wait up to 2s for #CarModel to repopulate. Without this, the next
+        // iteration's #CarColor set would race the cascade and get wiped.
+        await waitForCarModelCascade(2000);
+      }
+    } catch (e) {
+      skipped.push({ field: f.key, reason: String(e?.message || e) });
+    }
+  }
+
+  // ── 3. Nationality block (isolated as a unit) ──────────────────────────
+
+  try {
+    if (payload.nationType) {
+      setRadio("NationType", payload.nationType);
+      filled.push("nationType");
+      if (payload.nationType === "02" && payload.nationalityOTH) {
+        const oth = document.querySelector("#NationalityOTH");
+        if (!oth) {
+          skipped.push({ field: "nationalityOTH", reason: "selector_missing" });
+        } else {
+          setSelectViaJQuery(oth, payload.nationalityOTH);
+          if (oth.value !== String(payload.nationalityOTH)) {
+            skipped.push({
+              field: "nationalityOTH",
+              value: String(payload.nationalityOTH),
+              reason: "value_did_not_take",
+            });
+          } else {
+            filled.push("nationalityOTH");
+          }
+        }
+      }
+    } else {
+      skipped.push({ field: "nationType", reason: "no_data" });
+    }
+  } catch (e) {
+    skipped.push({ field: "nationType", reason: String(e?.message || e) });
+  }
+
+  // ── 4. Address cascade ─────────────────────────────────────────────────
+
+  await fillAddressCascade();
+
+  // ── 5. Zipcode (POST-cascade) ──────────────────────────────────────────
+  // Selecting Tumbol auto-populates #Zipcode with the tumbol's default zip,
+  // which overrides BC's actual mailing zip. So zipcode goes here, not in
+  // the simple-fields phase, to win the race.
+  try {
+    if (payload.zipcode == null) {
+      skipped.push({ field: "zipcode", reason: "no_data" });
+    } else {
+      const zEl = document.querySelector("#Zipcode");
+      if (!zEl) {
+        skipped.push({ field: "zipcode", reason: "selector_missing" });
+      } else {
+        setText(zEl, payload.zipcode);
+        if (zEl.value !== String(payload.zipcode)) {
+          skipped.push({ field: "zipcode", value: String(payload.zipcode), reason: "value_did_not_take" });
+        } else {
+          filled.push("zipcode");
+          filledExpected.set("zipcode", { selector: "#Zipcode", expected: String(payload.zipcode) });
+        }
+      }
+    }
+  } catch (e) {
+    skipped.push({ field: "zipcode", reason: String(e?.message || e) });
+  }
+
+  // ── 6. End-of-flow re-verify pass ──────────────────────────────────────
+  // Catches cross-field wipes (a later field's setter clobbering an earlier
+  // field's value). The immediate per-field verify can only see the moment
+  // right after each set; this pass sees the final settled state.
+  for (const [key, { selector, expected }] of filledExpected) {
+    const el = document.querySelector(selector);
+    if (!el || el.value !== expected) {
+      const idx = filled.indexOf(key);
+      if (idx >= 0) filled.splice(idx, 1);
+      skipped.push({ field: key, value: expected, reason: "wiped_by_later_field" });
     }
   }
 
   return { success: true, filled, skipped };
+
+  // ── inner: address cascade ─────────────────────────────────────────────
+
+  async function fillAddressCascade() {
+    const { changwatCode, amphurName, tumbolName } = payload;
+
+    if (!changwatCode) {
+      skipped.push(
+        { field: "changwat", reason: "no_data" },
+        { field: "amphur",   reason: "skipped_dependency" },
+        { field: "tumbol",   reason: "skipped_dependency" },
+      );
+      return;
+    }
+    try {
+      const cw = document.querySelector("#Changwat");
+      if (!cw) {
+        skipped.push(
+          { field: "changwat", reason: "selector_missing" },
+          { field: "amphur",   reason: "skipped_dependency" },
+          { field: "tumbol",   reason: "skipped_dependency" },
+        );
+        return;
+      }
+      setSelectViaJQuery(cw, changwatCode);
+      filled.push("changwat");
+    } catch (e) {
+      skipped.push(
+        { field: "changwat", reason: String(e?.message || e) },
+        { field: "amphur",   reason: "skipped_dependency" },
+        { field: "tumbol",   reason: "skipped_dependency" },
+      );
+      return;
+    }
+
+    if (!amphurName) {
+      skipped.push(
+        { field: "amphur", reason: "no_data" },
+        { field: "tumbol", reason: "skipped_dependency" },
+      );
+      return;
+    }
+    const amphurCode = await waitAndLookup("#Amphur", amphurName, 3000);
+    if (!amphurCode) {
+      skipped.push(
+        { field: "amphur", reason: `name_not_in_rvp:${amphurName}` },
+        { field: "tumbol", reason: "skipped_dependency" },
+      );
+      return;
+    }
+    setSelectViaJQuery(document.querySelector("#Amphur"), amphurCode);
+    filled.push("amphur");
+
+    if (!tumbolName) {
+      skipped.push({ field: "tumbol", reason: "no_data" });
+      return;
+    }
+    const tumbolCode = await waitAndLookup("#Tumbol", tumbolName, 3000);
+    if (!tumbolCode) {
+      skipped.push({ field: "tumbol", reason: `name_not_in_rvp:${tumbolName}` });
+      return;
+    }
+    setSelectViaJQuery(document.querySelector("#Tumbol"), tumbolCode);
+    filled.push("tumbol");
+  }
 }
 
 // Expose for service worker. Note: chrome.scripting.executeScript({func})

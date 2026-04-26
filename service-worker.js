@@ -41,11 +41,16 @@ function updateBadge(state) {
   chrome.action.setBadgeBackgroundColor({ color: cfg.color });
 }
 
-// ---- Entry point: FILL_PRB message from moto24 ----------------------------
+// ---- Entry point: FILL_PRB / GET_EXTENSION_VERSION from moto24 ------------
 
 chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
+      if (message?.type === "GET_EXTENSION_VERSION") {
+        const version = chrome.runtime.getManifest().version;
+        sendResponse({ success: true, version });
+        return;
+      }
       if (message?.type !== "FILL_PRB") {
         sendResponse({ success: false, error: "Unknown message type" });
         return;
@@ -136,9 +141,6 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
 
 // ---- Helpers --------------------------------------------------------------
 
-// Always target the real RVP form. For offline dev against /dummy-prb/,
-// temporarily return `${new URL(senderUrl).origin}/dummy-prb/form` here
-// (and re-add the senderUrl arg at the call site).
 function getTargetUrl() {
   return "https://epolicy4.rvp.co.th/Policy/New";
 }
