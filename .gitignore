@@ -1,3 +1,10 @@
 .DS_Store
 *.log
 node_modules/
+
+# Build outputs (release zips)
+dist/
+
+# Private keys — NEVER commit. Public key lives in manifest.json.
+*.pem
+*.key
