@@ -1,21 +1,32 @@
-# Moto24 พรบ Auto-Fill Extension (POC)
+# Moto24 พรบ Auto-Fill Extension
 
-Chrome Extension ที่รับสัญญาจาก moto24 `/registration-tracking` → เปิด dummy พรบ site → กรอก form อัตโนมัติ
+Chrome MV3 extension that auto-fills the RVP ePolicy พรบ form for [Moto24](https://moto24.roodee.io/registration-tracking)'s registration tracking pipeline.
 
-## Install (Unpacked)
+The extension is a thin shell — all field-mapping and BC-data resolution lives in the private moto24 repo. This extension receives a payload via `chrome.runtime.sendMessage`, opens the RVP form, fills 18 fields, and reports back.
 
-1. เปิด `chrome://extensions`
-2. เปิด "Developer mode" (มุมขวาบน)
-3. คลิก "Load unpacked" → เลือกโฟลเดอร์นี้
-4. จด Extension ID ที่แสดง (เช่น `abcdefghijklmnop...`)
-5. ใส่ Extension ID ใน moto24 `.env.local`: `NEXT_PUBLIC_PRB_EXTENSION_ID=<extension-id>`
-6. Restart `pnpm dev`
+## For officers
 
-## Dev Loop
+See the Thai install/update guide: [`docs/install-th.md`](docs/install-th.md).
 
-หลังแก้ไฟล์ → กลับมาที่ `chrome://extensions` → คลิก reload icon ที่ extension ของเรา → reload moto24 page
+Download the latest release: <https://github.com/chaptone/moto24-chrome-extension/releases/latest>.
 
-## Design & Plan
+## For developers
 
-- Design: `docs/superpowers/specs/2026-04-13-prb-autofill-chrome-extension-design.md` (in the moto24 repo)
-- Plan: `docs/superpowers/plans/2026-04-14-prb-autofill-chrome-extension.md` (in the moto24 repo)
+This is a public-source repo for an internal tool. See [`CLAUDE.md`](CLAUDE.md) for the public-repo guardrails (what's safe to commit, what isn't).
+
+### Build a release zip locally
+
+```bash
+pnpm zip
+# → produces dist/moto24-prb-extension-v<version>.zip
+```
+
+### Cut a new release
+
+1. Bump `version` in `manifest.json` and `package.json`.
+2. Bump `REQUIRED_EXTENSION_VERSION` in moto24's `lib/registration-tracking/constants.ts` if breaking.
+3. `git tag vX.Y.Z && git push --tags` — GitHub Actions builds + publishes the Release with the zip attached.
+
+### Architecture & gotchas
+
+See [`CLAUDE.md`](CLAUDE.md) for the implementation gotchas list (jQuery cascades, ISOLATED-vs-MAIN world, field ordering invariants, etc.). Original design docs live in the moto24 repo at `docs/superpowers/specs/2026-04-*-prb-*.md`.
