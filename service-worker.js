@@ -163,7 +163,31 @@ function waitForTabComplete(tabId, timeoutMs) {
   });
 }
 
-// ---- Startup --------------------------------------------------------------
+// ---- Startup / service-worker wake --------------------------------------
+//
+// Chrome MV3 service workers can be terminated at any time (idle eviction,
+// browser restart, etc.). If a flow was in WORKING state when the worker
+// died, the badge stays stuck at "…" forever. On every wake, check storage
+// for a stale WORKING/WAIT_LOGIN state and transition it to ERROR so the
+// badge unsticks.
+
+const STALE_FLOW_MS = 60_000;
+
+(async () => {
+  const obj = await chrome.storage.session.get(STATE_KEY);
+  const stored = obj[STATE_KEY];
+  const isStuck =
+    (stored?.state === STATES.WORKING || stored?.state === STATES.WAIT_LOGIN) &&
+    Date.now() - (stored.at ?? 0) > STALE_FLOW_MS;
+
+  if (isStuck) {
+    await setState(STATES.ERROR, {
+      error: "Flow timed out — service worker restarted mid-fill",
+    });
+  } else {
+    updateBadge(stored?.state ?? STATES.IDLE);
+  }
+})();
 
 chrome.runtime.onStartup.addListener(async () => {
   const obj = await chrome.storage.session.get(STATE_KEY);
