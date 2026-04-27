@@ -20,13 +20,13 @@ jobs:
 
       - name: Verify zip exists
         run: |
-          ls -lh dist/moto24-prb-extension-v*.zip
-          unzip -l dist/moto24-prb-extension-v*.zip | head -20
+          ls -lh dist/moto24-prb-extension.zip
+          unzip -l dist/moto24-prb-extension.zip | head -20
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/moto24-prb-extension-v*.zip
+          files: dist/moto24-prb-extension.zip
           generate_release_notes: true
           body: |
             ## วิธีติดตั้ง / อัพเดท
