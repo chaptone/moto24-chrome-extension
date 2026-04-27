@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write  # softprops/action-gh-release needs this to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build zip
+        run: bash scripts/build-zip.sh
+
+      - name: Verify zip exists
+        run: |
+          ls -lh dist/moto24-prb-extension-v*.zip
+          unzip -l dist/moto24-prb-extension-v*.zip | head -20
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/moto24-prb-extension-v*.zip
+          generate_release_notes: true
+          body: |
+            ## วิธีติดตั้ง / อัพเดท
+
+            ดู [คู่มือติดตั้งภาษาไทย](https://github.com/chaptone/moto24-chrome-extension/blob/main/docs/install-th.md)
+
+            ## โน้ต
+
+            หากใช้ extension นี้กับ moto24 — `NEXT_PUBLIC_PRB_EXTENSION_ID` ต้องตรงกับ ID ของ extension หลังติดตั้ง (ค่าเดียวกันสำหรับทุก officer)
