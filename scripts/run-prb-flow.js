@@ -77,6 +77,33 @@ async function runPRBFlow(payload) {
     }
   }
 
+  /**
+   * Set a <select> by matching the visible option label (textContent),
+   * not the underlying option value. Used for #CarModel where option
+   * values are opaque B0084**** codes the resolver doesn't (and shouldn't)
+   * know. The payload carries the user-visible label ("WAVE110i", "SCOOPY I",
+   * etc.); this helper finds the matching <option>, copies its value to
+   * el.value, then triggers the change event Select2 listens for.
+   *
+   * If no option matches the label, leaves el.value unchanged and returns
+   * false. The caller's verify-after-set step then records `value_did_not_take`.
+   */
+  function setSelectByLabel(el, label) {
+    const target = String(label).trim();
+    for (const opt of el.options) {
+      if (opt.textContent.trim() === target) {
+        el.value = opt.value;
+        if (window.jQuery) {
+          window.jQuery(el).trigger("change");
+        } else {
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
   function setRadio(name, value) {
     const el = document.querySelector(`input[name="${name}"][value="${value}"]`);
     if (el) el.click();
@@ -144,6 +171,7 @@ async function runPRBFlow(payload) {
   const SIMPLE_FIELDS = [
     { key: "chassisNumber",     selector: "#CarTankNo", setter: setText },
     { key: "marqueValue",       selector: "#MARQUE",    setter: setSelectViaJQuery, cascadeAfter: true },
+    { key: "carModelValue",     selector: "#CarModel",  setter: setSelectByLabel,   verifyLabel: true },
     { key: "carColorValue",     selector: "#CarColor",  setter: setSelectViaJQuery },
     { key: "carTypeValue",      selector: "#CarType",   setter: setSelectViaJQuery },
     { key: "carSize",           selector: "#CarSize",   setter: setText },
@@ -189,9 +217,15 @@ async function runPRBFlow(payload) {
         continue;
       }
       f.setter(el, value);
-      // Immediate verify — catches direct silent rejection (e.g. setting an
-      // unknown <option> on a <select> reverts to "" without throwing).
-      if (el.value !== String(value)) {
+      // Verify the set "took". For label-setters, compare the option's
+      // textContent against the payload label (since el.value is the
+      // opaque option-value code, not the label).
+      const tookValue = el.value !== "";
+      const tookLabelMatch =
+        !f.verifyLabel ||
+        (el.selectedOptions[0] &&
+          el.selectedOptions[0].textContent.trim() === String(value).trim());
+      if (!tookValue || !tookLabelMatch) {
         skipped.push({
           field: f.key,
           value: String(value),
@@ -200,7 +234,7 @@ async function runPRBFlow(payload) {
         continue;
       }
       filled.push(f.key);
-      filledExpected.set(f.key, { selector: f.selector, expected: String(value) });
+      filledExpected.set(f.key, { selector: f.selector, expected: el.value });
       if (f.cascadeAfter) {
         // Wait up to 2s for #CarModel to repopulate. Without this, the next
         // iteration's #CarColor set would race the cascade and get wiped.
