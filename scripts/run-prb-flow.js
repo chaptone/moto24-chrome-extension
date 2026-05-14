@@ -12,12 +12,19 @@
  * @typedef {Object} PRBPayload
  * @property {string} chassisNumber
  * @property {string|null} marqueValue
+ * @property {string|null} carModelValue
  * @property {string|null} carColorValue
  * @property {string|null} carSize
  * @property {string|null} carTypeValue
+ * @property {("1"|"2"|null)} licenseTypeValue
+ * @property {string|null} licenseAValue
+ * @property {string|null} licenseBValue
+ * @property {string|null} carChangwatCode
+ * @property {string|null} registrationNo  Raw HMETER plate string; banner uses it as a hint when a plate part couldn't be mapped.
  * @property {string|null} customerPrefix
  * @property {string|null} customerFirstName
  * @property {string|null} customerLastName
+ * @property {string|null} customerPhone
  * @property {string|null} cardId
  * @property {string|null} cardTypeValue
  * @property {string|null} birthdate
@@ -28,6 +35,12 @@
  * @property {string|null} amphurName
  * @property {string|null} tumbolName
  * @property {string|null} zipcode
+ * @property {boolean} useNAddress
+ * @property {string|null} nAddress
+ * @property {string|null} nChangwatCode
+ * @property {string|null} nAmphurName
+ * @property {string|null} nTumbolName
+ * @property {string|null} nZipcode
  */
 
 /**
@@ -104,6 +117,23 @@ async function runPRBFlow(payload) {
     return false;
   }
 
+  /**
+   * Set an iCheck-wrapped checkbox (RVP uses iCheck on the chkAddress checkbox).
+   * iCheck hides the underlying <input> and intercepts clicks — programmatic
+   * `el.checked = true` doesn't update the iCheck visual or fire the right
+   * events. The library's API does both. Falls back to plain checkbox handling
+   * if iCheck isn't loaded (defensive — current RVP loads iCheck globally).
+   */
+  function setCheckbox(el, value) {
+    const wantChecked = !!value;
+    if (window.jQuery && window.jQuery.fn.iCheck) {
+      window.jQuery(el).iCheck(wantChecked ? "check" : "uncheck");
+    } else {
+      el.checked = wantChecked;
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+  }
+
   function setRadio(name, value) {
     const el = document.querySelector(`input[name="${name}"][value="${value}"]`);
     if (el) el.click();
@@ -128,23 +158,76 @@ async function runPRBFlow(payload) {
   }
 
   // Polls a select for an option whose visible text matches targetName.
-  // Returns the option's `value` once found, or null on timeout / definite miss.
+  // Returns one of:
+  //   { kind: "found", value: "<option-value>" }                     — match found
+  //   { kind: "timeout", waitedMs, optionCount, optionsSample[] }    — never found within timeoutMs
+  //
+  // History:
+  //   v0.10.0: fingerprint + "options.length > 5 ⇒ definitive miss" heuristic.
+  //   v0.10.1+v0.10.2: same heuristic, fingerprint-gated. Tightened polling
+  //     to 50ms + 6s timeout. Still produced false misses intermittently —
+  //     the fingerprint can change MID-CASCADE when RVP appends options
+  //     one at a time. After the first few options land the fingerprint
+  //     differs from initial AND options.length > 5, but the target
+  //     (alphabetically later, e.g. ท่าศาลา) hasn't been added yet.
+  //   v0.10.3: removed the early-miss heuristic. We just keep polling
+  //     for a match until the 6s budget expires. The cost is real misses
+  //     wait the full 6s; those are rare in practice. Genuine "RVP doesn't
+  //     have this name" cases need the diagnostic info that comes with
+  //     the timeout result (optionsSample), not a fast-path return.
+  //
+  // Thai text defense: NFC-normalize both sides + collapse all whitespace.
+  // Cheap insurance against any future encoding divergence between HMETER
+  // and RVP (the historical "ท่าแพ double-เ" class of bugs).
   async function waitAndLookup(selector, targetName, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
+    const target = normalizeThai(targetName);
+    const start = Date.now();
+    const deadline = start + timeoutMs;
     while (Date.now() < deadline) {
       const sel = document.querySelector(selector);
       if (sel && sel.options.length > 1) {
         const match = Array.from(sel.options).find(
-          (o) => o.text.trim() === targetName.trim()
+          (o) => normalizeThai(o.text) === target
         );
-        if (match) return match.value;
-        // Heuristic: if the select is well-populated but our name isn't there,
-        // it's a definitive miss — don't waste the rest of the timeout.
-        if (sel.options.length > 5) return null;
+        if (match) return { kind: "found", value: match.value };
       }
-      await sleep(100);
+      await sleep(50);
     }
-    return null;
+    const sel = document.querySelector(selector);
+    const optionsSample = sel
+      ? Array.from(sel.options).slice(0, 30).map((o) => o.text.trim())
+      : [];
+    const waitedMs = Date.now() - start;
+    // Log a structured diagnostic so the officer (or us, via DevTools)
+    // can compare the actual final option list vs the expected name when
+    // a timeout fires. Without this, the banner only knows "no match"
+    // and we lose the byte-level evidence.
+    try {
+      console.warn("[moto24-prb] waitAndLookup timeout", {
+        selector,
+        target,
+        waitedMs,
+        optionCount: optionsSample.length,
+        optionsSample,
+      });
+    } catch (_) {
+      /* ignore */
+    }
+    return {
+      kind: "timeout",
+      waitedMs,
+      optionCount: optionsSample.length,
+    };
+  }
+
+  function normalizeThai(s) {
+    return (typeof s === "string" ? s : "")
+      .normalize("NFC")
+      // \s + NBSP + ZWSP/ZWNJ/ZWJ + BOM \u2014 collapse all invisible separators
+      // to a regular space before comparing. Defends against any future
+      // encoding divergence between HMETER and RVP option labels.
+      .replace(/[\s\u00A0\u200B-\u200D\uFEFF]+/g, " ")
+      .trim();
   }
 
   // ── 1. Dismiss PDPA + wait for form ────────────────────────────────────
@@ -168,6 +251,15 @@ async function runPRBFlow(payload) {
   //   • Setting #CarType wipes #CarSize. Verified live 2026-04-26.
   //     → CarType MUST come before CarSize.
   // Verified live in real RVP /Policy/New that this order keeps all values.
+  // NB: #CardType (ID type) and the nationality radio are intentionally NOT
+  // in this list. RVP defaults both correctly (บัตรประจำตัวประชาชน + Thai)
+  // for moto24's customer base; setting them ourselves only generates
+  // banner noise on the rare "BC has no card type" rows. Officer flips
+  // manually for the rare passport case.
+  //
+  // Plate row (#chkCarNo, #LicenseA, #LicenseB, #CarChangwat) is also NOT
+  // here — handled in Section 5c so we can branch on licenseTypeValue and
+  // silence A/B/Changwat for new MC (LicenseType="2") where RVP auto-fills.
   const SIMPLE_FIELDS = [
     { key: "chassisNumber",     selector: "#CarTankNo", setter: setText },
     { key: "marqueValue",       selector: "#MARQUE",    setter: setSelectViaJQuery, cascadeAfter: true },
@@ -180,7 +272,6 @@ async function runPRBFlow(payload) {
     { key: "customerLastName",  selector: "#Lname",     setter: setText },
     { key: "customerPhone",     selector: "#Tel",       setter: setText },
     { key: "cardId",            selector: "#CardID",    setter: setText },
-    { key: "cardTypeValue",     selector: "#CardType",  setter: setSelectViaJQuery },
     { key: "birthdate",         selector: "#Birthdate", setter: setText },
     { key: "address",           selector: "#Address",   setter: setText },
     // NB: zipcode is set AFTER the address cascade, not here. Selecting a
@@ -208,12 +299,22 @@ async function runPRBFlow(payload) {
     try {
       const value = payload[f.key];
       if (value == null) {
+        if (f.skipIfNull) {
+          // Quiet skip — not a banner-worthy "officer must fill". Used for
+          // N-block fields when useNAddress=false (same address).
+          continue;
+        }
         skipped.push({ field: f.key, reason: "no_data" });
         continue;
       }
       const el = document.querySelector(f.selector);
       if (!el) {
         skipped.push({ field: f.key, reason: "selector_missing" });
+        continue;
+      }
+      if (f.skipIfReadonly && el.readOnly) {
+        // Field is locked by an earlier-set field (e.g. LicenseA/B when
+        // LicenseType !== "1"). RVP auto-populates a sentinel; don't fight it.
         continue;
       }
       f.setter(el, value);
@@ -245,35 +346,12 @@ async function runPRBFlow(payload) {
     }
   }
 
-  // ── 3. Nationality block (isolated as a unit) ──────────────────────────
-
-  try {
-    if (payload.nationType) {
-      setRadio("NationType", payload.nationType);
-      filled.push("nationType");
-      if (payload.nationType === "02" && payload.nationalityOTH) {
-        const oth = document.querySelector("#NationalityOTH");
-        if (!oth) {
-          skipped.push({ field: "nationalityOTH", reason: "selector_missing" });
-        } else {
-          setSelectViaJQuery(oth, payload.nationalityOTH);
-          if (oth.value !== String(payload.nationalityOTH)) {
-            skipped.push({
-              field: "nationalityOTH",
-              value: String(payload.nationalityOTH),
-              reason: "value_did_not_take",
-            });
-          } else {
-            filled.push("nationalityOTH");
-          }
-        }
-      }
-    } else {
-      skipped.push({ field: "nationType", reason: "no_data" });
-    }
-  } catch (e) {
-    skipped.push({ field: "nationType", reason: String(e?.message || e) });
-  }
+  // ── 3. Nationality + ID type — INTENTIONALLY NOT SET ──────────────────
+  // RVP defaults both to Thai customer + บัตรประจำตัวประชาชน, which is
+  // correct for moto24's entire customer base. For the rare foreign /
+  // passport case, the officer flips manually. Setting these ourselves
+  // only generates "(ไม่มีข้อมูล)" banner noise when BC happens to lack
+  // the field, which is most of the time.
 
   // ── 4. Address cascade ─────────────────────────────────────────────────
 
@@ -304,6 +382,92 @@ async function runPRBFlow(payload) {
     skipped.push({ field: "zipcode", reason: String(e?.message || e) });
   }
 
+  // ── 5b. House-registration address block (only when useNAddress=true) ──
+  if (payload.useNAddress) {
+    // Set the chkAddress checkbox first so RVP's submit handler knows
+    // to treat the N-block as a separate address.
+    try {
+      const chk = document.querySelector("#chkAddress");
+      if (!chk) {
+        skipped.push({ field: "useNAddress", reason: "selector_missing" });
+      } else {
+        setCheckbox(chk, true);
+        filled.push("useNAddress");
+      }
+    } catch (e) {
+      skipped.push({ field: "useNAddress", reason: String(e?.message || e) });
+    }
+
+    // N-block address text
+    try {
+      if (payload.nAddress == null) {
+        skipped.push({ field: "nAddress", reason: "no_data" });
+      } else {
+        const el = document.querySelector("#NAddress");
+        if (!el) {
+          skipped.push({ field: "nAddress", reason: "selector_missing" });
+        } else {
+          setText(el, payload.nAddress);
+          filled.push("nAddress");
+        }
+      }
+    } catch (e) {
+      skipped.push({ field: "nAddress", reason: String(e?.message || e) });
+    }
+
+    // N-block cascade — same shape as fillAddressCascade but with N-prefixed selectors
+    await fillNAddressCascade();
+
+    // N-block zipcode (post-cascade, same reason as the current-address zipcode)
+    try {
+      if (payload.nZipcode == null) {
+        skipped.push({ field: "nZipcode", reason: "no_data" });
+      } else {
+        const zEl = document.querySelector("#NZipcode");
+        if (!zEl) {
+          skipped.push({ field: "nZipcode", reason: "selector_missing" });
+        } else {
+          setText(zEl, payload.nZipcode);
+          if (zEl.value !== String(payload.nZipcode)) {
+            skipped.push({ field: "nZipcode", value: String(payload.nZipcode), reason: "value_did_not_take" });
+          } else {
+            filled.push("nZipcode");
+          }
+        }
+      }
+    } catch (e) {
+      skipped.push({ field: "nZipcode", reason: String(e?.message || e) });
+    }
+
+    // N-block phone — same payload field (customerPhone) flows to #NTel
+    try {
+      if (payload.customerPhone == null) {
+        skipped.push({ field: "nTel", reason: "no_data" });
+      } else {
+        const el = document.querySelector("#NTel");
+        if (!el) {
+          skipped.push({ field: "nTel", reason: "selector_missing" });
+        } else {
+          setText(el, payload.customerPhone);
+          if (el.value !== String(payload.customerPhone)) {
+            skipped.push({ field: "nTel", value: String(payload.customerPhone), reason: "value_did_not_take" });
+          } else {
+            filled.push("nTel");
+          }
+        }
+      }
+    } catch (e) {
+      skipped.push({ field: "nTel", reason: String(e?.message || e) });
+    }
+  }
+
+  // ── 5c. Plate row (branches on licenseTypeValue) ───────────────────────
+  // Hand-written instead of SIMPLE_FIELDS so we can:
+  //   • silence A/B/Changwat for new MC (LicenseType="2") — RVP auto-fills
+  //     and locks them; flagging them as "no_data" is noise.
+  //   • still set #chkCarNo + report problems on used MC (LicenseType="1").
+  await fillPlateRow();
+
   // ── 6. End-of-flow re-verify pass ──────────────────────────────────────
   // Catches cross-field wipes (a later field's setter clobbering an earlier
   // field's value). The immediate per-field verify can only see the moment
@@ -317,7 +481,189 @@ async function runPRBFlow(payload) {
     }
   }
 
+  // ── 7. Render in-page banner for skipped fields ────────────────────────
+  renderSkippedBanner(skipped);
+
   return { success: true, filled, skipped };
+
+  // ── inner: skipped-fields banner ───────────────────────────────────────
+
+  function renderSkippedBanner(skippedFields) {
+    if (!Array.isArray(skippedFields) || skippedFields.length === 0) return;
+
+    // Remove any banner from a previous fill on this tab.
+    const prev = document.getElementById("moto24-prb-skipped-banner");
+    if (prev) prev.remove();
+
+    // field-key → { label, selector }. Selectors mirror SIMPLE_FIELDS + the
+    // address-cascade keys used in the skipped[] entries above.
+    const FIELDS = {
+      chassisNumber:     { label: "เลขตัวถัง",         selector: "#CarTankNo" },
+      marqueValue:       { label: "ยี่ห้อรถ",           selector: "#MARQUE" },
+      carModelValue:     { label: "รุ่นรถ",             selector: "#CarModel" },
+      carColorValue:     { label: "สีรถ",              selector: "#CarColor" },
+      carTypeValue:      { label: "รหัสรถ (CarType)",   selector: "#CarType" },
+      carSize:           { label: "ขนาดเครื่องยนต์ (cc)", selector: "#CarSize" },
+      customerPrefix:    { label: "คำนำหน้า",          selector: "#Prefix" },
+      customerFirstName: { label: "ชื่อ",              selector: "#Name" },
+      customerLastName:  { label: "นามสกุล",            selector: "#Lname" },
+      customerPhone:     { label: "เบอร์โทร",           selector: "#Tel" },
+      cardId:            { label: "เลขบัตรประชาชน",      selector: "#CardID" },
+      cardTypeValue:     { label: "ประเภทบัตร",         selector: "#CardType" },
+      birthdate:         { label: "วันเกิด",            selector: "#Birthdate" },
+      nationType:        { label: "สัญชาติ",           selector: "input[name='NationType']" },
+      nationalityOTH:    { label: "สัญชาติ (อื่น)",     selector: "#NationalityOTH" },
+      address:           { label: "ที่อยู่ (บรรทัด 1)",   selector: "#Address" },
+      changwat:          { label: "จังหวัด",            selector: "#Changwat" },
+      amphur:            { label: "อำเภอ",             selector: "#Amphur" },
+      tumbol:            { label: "ตำบล",              selector: "#Tumbol" },
+      zipcode:           { label: "รหัสไปรษณีย์",       selector: "#Zipcode" },
+      // Plate
+      licenseTypeValue:  { label: "ทะเบียนรถ",                  selector: "#chkCarNo" },
+      licenseAValue:     { label: "ทะเบียน (หมวดตัวอักษร)",      selector: "#LicenseA" },
+      licenseBValue:     { label: "ทะเบียน (หมวดตัวเลข)",        selector: "#LicenseB" },
+      carChangwatCode:   { label: "ทะเบียน (จังหวัด)",           selector: "#CarChangwat" },
+      // N-block (house registration)
+      useNAddress:       { label: "ที่อยู่ทะเบียนบ้าน (toggle)", selector: "#chkAddress" },
+      nAddress:          { label: "ที่อยู่ตามทะเบียน",     selector: "#NAddress" },
+      nChangwat:         { label: "จังหวัด (ทะเบียนบ้าน)", selector: "#NChangwat" },
+      nAmphur:           { label: "อำเภอ (ทะเบียนบ้าน)",  selector: "#NAmphur" },
+      nTumbol:           { label: "ตำบล (ทะเบียนบ้าน)",   selector: "#NTumbol" },
+      nZipcode:          { label: "รหัสไปรษณีย์ (ทะเบียนบ้าน)", selector: "#NZipcode" },
+      nTel:              { label: "เบอร์โทร (ทะเบียนบ้าน)", selector: "#NTel" },
+    };
+
+    // De-duplicate by field key — a field may be reported twice (e.g. once
+    // as `value_did_not_take` then again as `wiped_by_later_field`).
+    const seen = new Set();
+    const unique = [];
+    for (const item of skippedFields) {
+      if (seen.has(item.field)) continue;
+      seen.add(item.field);
+      unique.push(item);
+    }
+
+    // One-time style injection.
+    if (!document.getElementById("moto24-prb-skipped-style")) {
+      const style = document.createElement("style");
+      style.id = "moto24-prb-skipped-style";
+      style.textContent =
+        "#moto24-prb-skipped-banner{position:fixed;top:16px;right:16px;z-index:2147483647;" +
+        "width:320px;max-height:calc(100vh - 32px);overflow:auto;background:#fffbeb;" +
+        "border:1px solid #f59e0b;border-radius:10px;box-shadow:0 10px 25px rgba(0,0,0,.15);" +
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;" +
+        "color:#1f2937}" +
+        "#moto24-prb-skipped-banner .hd{display:flex;align-items:center;justify-content:space-between;" +
+        "padding:10px 12px;background:#fde68a;border-radius:10px 10px 0 0;font-weight:600;color:#78350f}" +
+        "#moto24-prb-skipped-banner .ct{font-size:12px;background:#b45309;color:#fff;border-radius:999px;" +
+        "padding:2px 8px;margin-left:6px}" +
+        "#moto24-prb-skipped-banner .x{cursor:pointer;border:0;background:transparent;font-size:18px;" +
+        "color:#78350f;padding:0 4px;line-height:1}" +
+        "#moto24-prb-skipped-banner ul{list-style:none;margin:0;padding:6px 0}" +
+        "#moto24-prb-skipped-banner li{padding:0}" +
+        "#moto24-prb-skipped-banner li button{display:flex;align-items:center;width:100%;text-align:left;" +
+        "padding:8px 12px;background:transparent;border:0;font:inherit;color:#1f2937;cursor:pointer}" +
+        "#moto24-prb-skipped-banner li button:hover{background:#fef3c7}" +
+        "#moto24-prb-skipped-banner li button::before{content:'•';color:#b45309;margin-right:8px;font-weight:700}" +
+        "#moto24-prb-skipped-banner .reason{color:#6b7280;font-size:11px;margin-left:6px}" +
+        ".moto24-prb-flash{outline:3px solid #f59e0b!important;outline-offset:2px;transition:outline .2s}";
+      document.head.appendChild(style);
+    }
+
+    const banner = document.createElement("div");
+    banner.id = "moto24-prb-skipped-banner";
+    banner.setAttribute("role", "region");
+    banner.setAttribute("aria-label", "ช่องที่ต้องเลือกเอง");
+
+    const header = document.createElement("div");
+    header.className = "hd";
+    header.innerHTML =
+      "<span>⚠️ ต้องเลือกเอง<span class=\"ct\"></span></span>" +
+      "<button class=\"x\" type=\"button\" aria-label=\"ปิด\">×</button>";
+    header.querySelector(".ct").textContent = String(unique.length);
+    header.querySelector(".x").addEventListener("click", () => banner.remove());
+    banner.appendChild(header);
+
+    const ul = document.createElement("ul");
+    for (const item of unique) {
+      const def = FIELDS[item.field];
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+
+      const labelText = def ? def.label : item.field;
+      const reasonText = bannerHintFor(item, payload);
+      btn.innerHTML = "";
+      btn.appendChild(document.createTextNode(labelText));
+      if (reasonText) {
+        const r = document.createElement("span");
+        r.className = "reason";
+        r.textContent = reasonText;
+        btn.appendChild(r);
+      }
+      btn.addEventListener("click", () => focusField(def?.selector));
+      li.appendChild(btn);
+      ul.appendChild(li);
+    }
+    banner.appendChild(ul);
+    document.body.appendChild(banner);
+  }
+
+  // Per-field hint shown after the label in the banner. Plate-related rows
+  // get a special treatment: when HMETER's registration_no is non-null, we
+  // show the raw plate verbatim instead of "(ไม่มีข้อมูล)" — the resolver
+  // had data, just couldn't fully map it. Reserves "(ไม่มีข้อมูล)" for the
+  // truly-empty case where registration_no itself was null.
+  function bannerHintFor(item, payload) {
+    const PLATE_FIELDS = new Set([
+      "licenseAValue",
+      "licenseBValue",
+      "carChangwatCode",
+    ]);
+    if (PLATE_FIELDS.has(item.field) && payload.registrationNo) {
+      return " - (" + payload.registrationNo + ")";
+    }
+    return friendlyReason(item.reason);
+  }
+
+  function friendlyReason(reason) {
+    if (!reason) return "";
+    if (reason === "no_data") return "(ไม่มีข้อมูล)";
+    if (reason === "selector_missing") return "(ไม่พบช่อง)";
+    if (reason === "skipped_dependency") return "(รอช่องก่อนหน้า)";
+    if (reason === "value_did_not_take") return "(เลือกไม่สำเร็จ)";
+    if (reason === "wiped_by_later_field") return "(ถูกล้างทับ)";
+    if (reason.startsWith("lookup_timeout:")) {
+      // Format: lookup_timeout:<waitedMs>ms:<targetName>
+      // Single reason for both "RVP cascade slow" and "RVP cascade returned
+      // a list that doesn't contain the target" — we can't distinguish them
+      // safely. The DevTools console.warn from waitAndLookup carries the
+      // diagnostic info (full option list at timeout).
+      const rest = reason.slice("lookup_timeout:".length);
+      const [waited, name] = rest.split(":");
+      return "(ไม่พบใน RVP หลังรอ " + waited + ": " + name + ")";
+    }
+    return "(" + reason + ")";
+  }
+
+  function focusField(selector) {
+    if (!selector) return;
+    const el = document.querySelector(selector);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    // For Select2-wrapped selects, the underlying <select> is display:none
+    // and can't take focus. Flash the visible Select2 container instead.
+    let flashTarget = el;
+    if (el.classList.contains("select2-hidden-accessible")) {
+      const s2 = document.querySelector("#select2-" + el.id + "-container");
+      if (s2) flashTarget = s2.closest(".select2-container") || s2;
+    }
+    flashTarget.classList.add("moto24-prb-flash");
+    if (typeof el.focus === "function" && !el.classList.contains("select2-hidden-accessible")) {
+      try { el.focus({ preventScroll: true }); } catch (_) { /* ignore */ }
+    }
+    setTimeout(() => flashTarget.classList.remove("moto24-prb-flash"), 1800);
+  }
 
   // ── inner: address cascade ─────────────────────────────────────────────
 
@@ -360,28 +706,156 @@ async function runPRBFlow(payload) {
       );
       return;
     }
-    const amphurCode = await waitAndLookup("#Amphur", amphurName, 3000);
-    if (!amphurCode) {
+    const amphurLookup = await waitAndLookup("#Amphur", amphurName, 6000);
+    if (amphurLookup.kind !== "found") {
       skipped.push(
-        { field: "amphur", reason: `name_not_in_rvp:${amphurName}` },
+        { field: "amphur", reason: `lookup_timeout:${amphurLookup.waitedMs}ms:${amphurName}` },
         { field: "tumbol", reason: "skipped_dependency" },
       );
       return;
     }
-    setSelectViaJQuery(document.querySelector("#Amphur"), amphurCode);
+    setSelectViaJQuery(document.querySelector("#Amphur"), amphurLookup.value);
     filled.push("amphur");
 
     if (!tumbolName) {
       skipped.push({ field: "tumbol", reason: "no_data" });
       return;
     }
-    const tumbolCode = await waitAndLookup("#Tumbol", tumbolName, 3000);
-    if (!tumbolCode) {
-      skipped.push({ field: "tumbol", reason: `name_not_in_rvp:${tumbolName}` });
+    const tumbolLookup = await waitAndLookup("#Tumbol", tumbolName, 6000);
+    if (tumbolLookup.kind !== "found") {
+      skipped.push({
+        field: "tumbol",
+        reason: `lookup_timeout:${tumbolLookup.waitedMs}ms:${tumbolName}`,
+      });
       return;
     }
-    setSelectViaJQuery(document.querySelector("#Tumbol"), tumbolCode);
+    setSelectViaJQuery(document.querySelector("#Tumbol"), tumbolLookup.value);
     filled.push("tumbol");
+  }
+
+  async function fillPlateRow() {
+    const lt = payload.licenseTypeValue;
+    if (lt !== "1" && lt !== "2") return; // null / unexpected — leave RVP defaults alone
+
+    // 1) Set #chkCarNo — gates everything downstream
+    try {
+      const chkEl = document.querySelector("#chkCarNo");
+      if (!chkEl) {
+        skipped.push({ field: "licenseTypeValue", reason: "selector_missing" });
+        return;
+      }
+      setSelectViaJQuery(chkEl, lt);
+      if (chkEl.value !== lt) {
+        skipped.push({ field: "licenseTypeValue", value: lt, reason: "value_did_not_take" });
+        return;
+      }
+      filled.push("licenseTypeValue");
+      filledExpected.set("licenseTypeValue", { selector: "#chkCarNo", expected: lt });
+    } catch (e) {
+      skipped.push({ field: "licenseTypeValue", reason: String(e?.message || e) });
+      return;
+    }
+
+    // New MC (LicenseType="2") → RVP auto-fills LicenseA="ป้ายแดง" + LicenseB=" "
+    // and locks them readOnly. Officer never picks A/B/Changwat — silently skip.
+    if (lt === "2") return;
+
+    // Used MC (LicenseType="1") — attempt A/B/Changwat with full reporting.
+    fillPlateField("licenseAValue", "#LicenseA", setText);
+    fillPlateField("licenseBValue", "#LicenseB", setText);
+    fillPlateField("carChangwatCode", "#CarChangwat", setSelectViaJQuery);
+  }
+
+  function fillPlateField(key, selector, setter) {
+    try {
+      if (payload[key] == null) {
+        skipped.push({ field: key, reason: "no_data" });
+        return;
+      }
+      const el = document.querySelector(selector);
+      if (!el) {
+        skipped.push({ field: key, reason: "selector_missing" });
+        return;
+      }
+      // Defensive: if RVP locked the field (shouldn't happen for LicenseType=1
+      // on A/B/Changwat) just skip rather than fight.
+      if (el.readOnly) return;
+      setter(el, payload[key]);
+      if (el.value !== String(payload[key])) {
+        skipped.push({ field: key, value: String(payload[key]), reason: "value_did_not_take" });
+        return;
+      }
+      filled.push(key);
+      filledExpected.set(key, { selector, expected: el.value });
+    } catch (e) {
+      skipped.push({ field: key, reason: String(e?.message || e) });
+    }
+  }
+
+  async function fillNAddressCascade() {
+    const { nChangwatCode, nAmphurName, nTumbolName } = payload;
+
+    if (!nChangwatCode) {
+      skipped.push(
+        { field: "nChangwat", reason: "no_data" },
+        { field: "nAmphur",   reason: "skipped_dependency" },
+        { field: "nTumbol",   reason: "skipped_dependency" },
+      );
+      return;
+    }
+    try {
+      const cw = document.querySelector("#NChangwat");
+      if (!cw) {
+        skipped.push(
+          { field: "nChangwat", reason: "selector_missing" },
+          { field: "nAmphur",   reason: "skipped_dependency" },
+          { field: "nTumbol",   reason: "skipped_dependency" },
+        );
+        return;
+      }
+      setSelectViaJQuery(cw, nChangwatCode);
+      filled.push("nChangwat");
+    } catch (e) {
+      skipped.push(
+        { field: "nChangwat", reason: String(e?.message || e) },
+        { field: "nAmphur",   reason: "skipped_dependency" },
+        { field: "nTumbol",   reason: "skipped_dependency" },
+      );
+      return;
+    }
+
+    if (!nAmphurName) {
+      skipped.push(
+        { field: "nAmphur", reason: "no_data" },
+        { field: "nTumbol", reason: "skipped_dependency" },
+      );
+      return;
+    }
+    const nAmphurLookup = await waitAndLookup("#NAmphur", nAmphurName, 6000);
+    if (nAmphurLookup.kind !== "found") {
+      skipped.push(
+        { field: "nAmphur", reason: `lookup_timeout:${nAmphurLookup.waitedMs}ms:${nAmphurName}` },
+        { field: "nTumbol", reason: "skipped_dependency" },
+      );
+      return;
+    }
+    setSelectViaJQuery(document.querySelector("#NAmphur"), nAmphurLookup.value);
+    filled.push("nAmphur");
+
+    if (!nTumbolName) {
+      skipped.push({ field: "nTumbol", reason: "no_data" });
+      return;
+    }
+    const nTumbolLookup = await waitAndLookup("#NTumbol", nTumbolName, 6000);
+    if (nTumbolLookup.kind !== "found") {
+      skipped.push({
+        field: "nTumbol",
+        reason: `lookup_timeout:${nTumbolLookup.waitedMs}ms:${nTumbolName}`,
+      });
+      return;
+    }
+    setSelectViaJQuery(document.querySelector("#NTumbol"), nTumbolLookup.value);
+    filled.push("nTumbol");
   }
 }
 
