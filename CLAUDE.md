@@ -14,7 +14,7 @@ Everything pushed here is visible to the world. Treat every commit accordingly.
 - `.env` files, `.env.local`, or any environment dumps
 - The `.pem` private key used to sign the extension (lives in user's `~/vault/`, NOT in this repo)
 - Customer data, real contract numbers, real chassis numbers, real names — even in test fixtures or screenshots
-- Internal hostnames beyond `moto24.roodee.io` and `localhost` (those are already declared in `manifest.json`)
+- Internal hostnames beyond `moto24.roodee.io` (staging), `operation.moto24.co.th` (production), and `localhost` (those are already declared in `manifest.json`)
 - Stack traces or debug dumps that include any of the above
 
 ### SAFE to commit
