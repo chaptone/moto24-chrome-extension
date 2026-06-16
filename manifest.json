@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Moto24 พรบ Auto-Fill",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyBk5jdXzfKGXHvo5+SU7h8K0ntT/1cB1FE5US6LO1cpGBk1rH4jDb1W4s9/GfGE51YzU3VdfwT+3QWB6d8vaeUlOkIm9GNDr8E/pk3Fr098e/Iex3s9Y7/lPCmuiEnrNLPUxiHgIkkIOQ/Uuy6WDK4nsV+zBY/B0eT/lsffc1R5KFDpXipzdGXHq8dj5cRp6e1D93cQ/htIkOmErZze9xAjG5QScYMSSGdsFepN10vicXYANbFp9Ya7ffnGqhonZmQ9CUQCEuCubWbyHQ3UEFQWj/BkfK9wwuh7UNj40s7AqLxAmYGkioooalrVl0mLTAoHpGbGK34glHwLDqRdLAQIDAQAB",
   "description": "กรอกข้อมูล พรบ อัตโนมัติจากระบบ Moto24 (รองรับเว็บ RVP จริง)",
   "permissions": ["storage", "scripting", "tabs"],

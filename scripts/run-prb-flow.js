@@ -67,6 +67,13 @@
 async function runPRBFlow(payload) {
   const filled = [];
   const skipped = [];
+  // Records simple-fields that PASSED their immediate verify, so the end-of-flow
+  // re-verify pass can catch cross-field wipes (e.g. setting #CarType wiping
+  // #CarSize). Map: key → { selector, expected }. MUST be declared at function
+  // scope (not inside the fill-pipeline try block) — the hoisted fillPlateRow()
+  // runs at function scope and writes to it, so a block-scoped const would throw
+  // "filledExpected is not defined" there.
+  const filledExpected = new Map();
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -77,17 +84,37 @@ async function runPRBFlow(payload) {
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
     if (setter) setter.call(el, value);
     else el.value = value;
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
+    // Best-effort — RVP's input/change handlers can throw (see fireChange).
+    // Value is already set; never let a thrown handler abort the pipeline.
+    try {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (_) {
+      /* RVP handler threw — value is set, keep going */
+    }
+  }
+
+  /**
+   * Fire a change event on `el` BEST-EFFORT — RVP's own change handlers can
+   * throw (its sweetalert2.js is 404'd, and a province-reset can null DOM that
+   * its amphur handler then reads — observed: `New:5135 TypeError: Cannot read
+   * properties of undefined (reading 'value')`). The caller has ALREADY set
+   * el.value, so RVP reacting is best-effort: a throw here must never abort our
+   * pipeline. Swallow it; the caller's post-set verify confirms the value took.
+   */
+  function fireChange(el) {
+    try {
+      if (window.jQuery) window.jQuery(el).trigger("change");
+      else el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (_) {
+      /* RVP handler threw — value is already set, keep going */
+    }
   }
 
   function setSelectViaJQuery(el, value) {
     el.value = value;
-    if (window.jQuery) {
-      window.jQuery(el).trigger("change");
-    } else {
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    }
+    if (window.jQuery) window.jQuery(el).val(value);
+    fireChange(el);
   }
 
   /**
@@ -106,11 +133,7 @@ async function runPRBFlow(payload) {
     for (const opt of el.options) {
       if (opt.textContent.trim() === target) {
         el.value = opt.value;
-        if (window.jQuery) {
-          window.jQuery(el).trigger("change");
-        } else {
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        }
+        fireChange(el);
         return true;
       }
     }
@@ -126,17 +149,28 @@ async function runPRBFlow(payload) {
    */
   function setCheckbox(el, value) {
     const wantChecked = !!value;
-    if (window.jQuery && window.jQuery.fn.iCheck) {
-      window.jQuery(el).iCheck(wantChecked ? "check" : "uncheck");
-    } else {
-      el.checked = wantChecked;
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+    // Best-effort — iCheck/RVP handlers can throw (see fireChange).
+    try {
+      if (window.jQuery && window.jQuery.fn.iCheck) {
+        window.jQuery(el).iCheck(wantChecked ? "check" : "uncheck");
+      } else {
+        el.checked = wantChecked;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    } catch (_) {
+      el.checked = wantChecked; // fallback so the state is at least correct
     }
   }
 
   function setRadio(name, value) {
     const el = document.querySelector(`input[name="${name}"][value="${value}"]`);
-    if (el) el.click();
+    if (el) {
+      try {
+        el.click();
+      } catch (_) {
+        /* RVP handler threw — selection is set, keep going */
+      }
+    }
   }
 
   async function dismissPDPAModalIfPresent() {
@@ -157,39 +191,53 @@ async function runPRBFlow(payload) {
     return false;
   }
 
-  // Polls a select for an option whose visible text matches targetName.
-  // Returns one of:
-  //   { kind: "found", value: "<option-value>" }                     — match found
-  //   { kind: "timeout", waitedMs, optionCount, optionsSample[] }    — never found within timeoutMs
+  // Select an <option> by its visible TEXT, robust to RVP's async
+  // province→amphur (and amphur→tambon) cascade.
   //
-  // History:
-  //   v0.10.0: fingerprint + "options.length > 5 ⇒ definitive miss" heuristic.
-  //   v0.10.1+v0.10.2: same heuristic, fingerprint-gated. Tightened polling
-  //     to 50ms + 6s timeout. Still produced false misses intermittently —
-  //     the fingerprint can change MID-CASCADE when RVP appends options
-  //     one at a time. After the first few options land the fingerprint
-  //     differs from initial AND options.length > 5, but the target
-  //     (alphabetically later, e.g. ท่าศาลา) hasn't been added yet.
-  //   v0.10.3: removed the early-miss heuristic. We just keep polling
-  //     for a match until the 6s budget expires. The cost is real misses
-  //     wait the full 6s; those are rare in practice. Genuine "RVP doesn't
-  //     have this name" cases need the diagnostic info that comes with
-  //     the timeout result (optionsSample), not a fast-path return.
+  // WHY by text, not value — RVP's amphur/tambon `<option value>` is the
+  // 2-digit *in-province* admin code, NOT a nationwide-unique id. So value
+  // "07" is ชะอวด under province 80 (นครศรีธรรมราช) but วังวิเศษ under
+  // province 92 (ตรัง); "08" is ท่าศาลา vs นาโยง. Committing a value captured
+  // from one province's list while the <select> holds another province's list
+  // silently renders the wrong amphur (the ชะอวด→วังวิเศษ field bug). So we
+  // match AND commit against the SAME live list with no gap, then settle and
+  // re-verify the committed option's TEXT (the only stable id).
+  //
+  // WHY no re-trigger of the parent here — verified live in DevTools against
+  // RVP (2026-06-16): a SINGLE `$('#Changwat').val(code).trigger('change')`
+  // reliably reloads #Amphur to the new province's list (RVP's GetAmphur AJAX,
+  // ~0.5–2s; slower on a cold tab). An earlier version re-fired the province
+  // every 800ms when the target was still absent — that RESTARTED the in-flight
+  // GetAmphur before it could finish, so #Amphur never settled and the lookup
+  // timed out on the form's default ตรัง list. The cure is to set the parent
+  // ONCE (the caller does that) and just POLL here until the new list lands.
+  // A genuine AJAX drop is rare and falls through to the banner (safe).
   //
   // Thai text defense: NFC-normalize both sides + collapse all whitespace.
-  // Cheap insurance against any future encoding divergence between HMETER
-  // and RVP (the historical "ท่าแพ double-เ" class of bugs).
-  async function waitAndLookup(selector, targetName, timeoutMs) {
+  async function selectByTextStable(selector, targetName, timeoutMs) {
     const target = normalizeThai(targetName);
     const start = Date.now();
     const deadline = start + timeoutMs;
     while (Date.now() < deadline) {
       const sel = document.querySelector(selector);
-      if (sel && sel.options.length > 1) {
-        const match = Array.from(sel.options).find(
-          (o) => normalizeThai(o.text) === target
-        );
-        if (match) return { kind: "found", value: match.value };
+      const match =
+        sel && sel.options.length > 1
+          ? Array.from(sel.options).find((o) => normalizeThai(o.text) === target)
+          : null;
+      if (match) {
+        // Commit against THIS live list (no capture/apply gap), then let any
+        // in-flight cascade settle and re-verify by TEXT.
+        setSelectViaJQuery(sel, match.value);
+        await sleep(150);
+        const after = document.querySelector(selector);
+        if (
+          after &&
+          after.selectedOptions[0] &&
+          normalizeThai(after.selectedOptions[0].text) === target
+        ) {
+          return { kind: "found" };
+        }
+        // drifted (a later RVP cascade swapped the list) — keep polling
       }
       await sleep(50);
     }
@@ -198,12 +246,10 @@ async function runPRBFlow(payload) {
       ? Array.from(sel.options).slice(0, 30).map((o) => o.text.trim())
       : [];
     const waitedMs = Date.now() - start;
-    // Log a structured diagnostic so the officer (or us, via DevTools)
-    // can compare the actual final option list vs the expected name when
-    // a timeout fires. Without this, the banner only knows "no match"
-    // and we lose the byte-level evidence.
+    // Structured diagnostic so the officer (or us, via DevTools) can compare
+    // the actual final option list vs the expected name on a genuine miss.
     try {
-      console.warn("[moto24-prb] waitAndLookup timeout", {
+      console.warn("[moto24-prb] selectByTextStable timeout", {
         selector,
         target,
         waitedMs,
@@ -217,6 +263,7 @@ async function runPRBFlow(payload) {
       kind: "timeout",
       waitedMs,
       optionCount: optionsSample.length,
+      optionsSample,
     };
   }
 
@@ -232,6 +279,36 @@ async function runPRBFlow(payload) {
 
   // ── 1. Dismiss PDPA + wait for form ────────────────────────────────────
 
+  // Wait until a cascade-child <select> has loaded options AND they've stopped
+  // changing — i.e. RVP's OWN default-province load has settled. On page load
+  // RVP fires GetAmphur_bydefault for the agent's default province (ตรัง); if we
+  // set #Changwat before that finishes, the late default response clobbers
+  // #Amphur back to ตรัง (confirmed live; a real failing tab showed a merged
+  // 35-option ตรัง+นครศรีธรรมราช list) → the ~1/6 "stuck on ตรัง" timeout. Gating
+  // the province set on this lets the default load finish first so our change
+  // wins. MUST be at function scope — the hoisted fillAddressCascade/
+  // fillNAddressCascade call it; declaring it inside the pipeline try block
+  // below would be block-scoped → "waitForChildStable is not defined".
+  async function waitForChildStable(selector, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let lastSig = null;
+    let stableSince = 0;
+    while (Date.now() < deadline) {
+      const sel = document.querySelector(selector);
+      if (sel && sel.options.length > 1) {
+        const sig = sel.options.length + "|" + (sel.options[1] && sel.options[1].text);
+        if (sig === lastSig) {
+          if (Date.now() - stableSince >= 400) return true;
+        } else {
+          lastSig = sig;
+          stableSince = Date.now();
+        }
+      }
+      await sleep(100);
+    }
+    return false;
+  }
+
   await dismissPDPAModalIfPresent();
   const ready = await waitForFormReady();
   if (!ready) return { success: false, error: "RVP อาจเปลี่ยนโครงสร้างหน้าเว็บ" };
@@ -242,6 +319,13 @@ async function runPRBFlow(payload) {
     return { success: false, error: "ไม่พบช่องเลขตัวถัง (#CarTankNo)" };
   }
 
+  // The fill pipeline is wrapped so an exception thrown from inside an RVP
+  // change handler (e.g. its sweetalert2.js is 404'd → a validation popup
+  // ReferenceErrors mid-cascade) can NEVER abort us silently. On throw we log
+  // the real error and fall through to render the banner with whatever filled,
+  // so the officer always sees what still needs manual entry. INVARIANT: the
+  // bot never finishes with unfilled/wrong fields and no banner.
+  try {
   // ── 2. Simple non-cascade fields (each isolated) ───────────────────────
 
   // Order matters — RVP triggers reactive resets between fields:
@@ -289,11 +373,6 @@ async function runPRBFlow(payload) {
     }
     return false;
   }
-
-  // Records simple-fields that PASSED their immediate verify, so the
-  // end-of-flow re-verify pass can catch any cross-field wipes (e.g. setting
-  // #CarType wiping #CarSize). Map: key → { selector, expected }.
-  const filledExpected = new Map();
 
   for (const f of SIMPLE_FIELDS) {
     try {
@@ -481,7 +560,56 @@ async function runPRBFlow(payload) {
     }
   }
 
-  // ── 7. Render in-page banner for skipped fields ────────────────────────
+  // ── 6b. Address-cascade TEXT re-verify ─────────────────────────────────
+  // The filledExpected pass above compares el.value, which is unreliable for
+  // amphur/tambon (province-local option values — see selectByTextStable).
+  // A later field (zipcode, the N-block, the plate row) can re-fire a cascade
+  // that swaps an earlier select's list out from under a committed value, so
+  // verify the four cascade selects by TEXT one final time. On drift, demote
+  // filled→skipped so it surfaces in the banner instead of being silently
+  // submitted wrong (the original ชะอวด→วังวิเศษ failure mode).
+  const ADDRESS_TEXT_VERIFY = [
+    { field: "amphur",  selector: "#Amphur",  expected: payload.amphurName },
+    { field: "tumbol",  selector: "#Tumbol",  expected: payload.tumbolName },
+    { field: "nAmphur", selector: "#NAmphur", expected: payload.nAmphurName },
+    { field: "nTumbol", selector: "#NTumbol", expected: payload.nTumbolName },
+  ];
+  for (const { field, selector, expected } of ADDRESS_TEXT_VERIFY) {
+    if (!filled.includes(field) || expected == null) continue;
+    const el = document.querySelector(selector);
+    const ok =
+      el &&
+      el.selectedOptions[0] &&
+      normalizeThai(el.selectedOptions[0].text) === normalizeThai(expected);
+    if (!ok) {
+      const idx = filled.indexOf(field);
+      if (idx >= 0) filled.splice(idx, 1);
+      skipped.push({ field, value: String(expected), reason: "wiped_by_later_field" });
+    }
+  }
+
+  } catch (flowErr) {
+    // RVP threw inside one of its own change handlers mid-fill. Don't abort
+    // silently — surface it so the next run's console pinpoints the field.
+    try {
+      console.error("[moto24-prb] fill pipeline threw", flowErr);
+    } catch (_) {
+      /* ignore */
+    }
+    skipped.push({
+      field: "_pipeline_error",
+      reason: String(flowErr?.message || flowErr),
+    });
+  }
+
+  // ── 7. Render in-page banner for skipped fields (ALWAYS runs) ──────────
+  // One structured line so a failing run is fully diagnosable from the console
+  // (which fields took, which were skipped + why) without re-instrumenting.
+  try {
+    console.log("[moto24-prb] result", { filled, skipped });
+  } catch (_) {
+    /* ignore */
+  }
   renderSkippedBanner(skipped);
 
   return { success: true, filled, skipped };
@@ -531,6 +659,8 @@ async function runPRBFlow(payload) {
       nTumbol:           { label: "ตำบล (ทะเบียนบ้าน)",   selector: "#NTumbol" },
       nZipcode:          { label: "รหัสไปรษณีย์ (ทะเบียนบ้าน)", selector: "#NZipcode" },
       nTel:              { label: "เบอร์โทร (ทะเบียนบ้าน)", selector: "#NTel" },
+      // Pipeline aborted by a thrown RVP handler — see console for the error.
+      _pipeline_error:   { label: "ระบบกรอกขัดข้อง (ดู Console)", selector: null },
     };
 
     // De-duplicate by field key — a field may be reported twice (e.g. once
@@ -637,7 +767,7 @@ async function runPRBFlow(payload) {
       // Format: lookup_timeout:<waitedMs>ms:<targetName>
       // Single reason for both "RVP cascade slow" and "RVP cascade returned
       // a list that doesn't contain the target" — we can't distinguish them
-      // safely. The DevTools console.warn from waitAndLookup carries the
+      // safely. The DevTools console.warn from selectByTextStable carries the
       // diagnostic info (full option list at timeout).
       const rest = reason.slice("lookup_timeout:".length);
       const [waited, name] = rest.split(":");
@@ -688,6 +818,9 @@ async function runPRBFlow(payload) {
         );
         return;
       }
+      // Let RVP's default-province amphur load settle first, so its late
+      // response can't clobber our province change (see waitForChildStable).
+      await waitForChildStable("#Amphur", 5000);
       setSelectViaJQuery(cw, changwatCode);
       filled.push("changwat");
     } catch (e) {
@@ -706,30 +839,34 @@ async function runPRBFlow(payload) {
       );
       return;
     }
-    const amphurLookup = await waitAndLookup("#Amphur", amphurName, 6000);
-    if (amphurLookup.kind !== "found") {
+    // #Changwat was set once above; RVP's GetAmphur AJAX reloads #Amphur for
+    // this province (~0.5–2s) — just poll until ท่าศาลา&co. land. 8s budget
+    // covers a cold-tab load. (Do NOT re-fire #Changwat while polling — that
+    // restarts the in-flight AJAX and the list never settles.)
+    const amphurResult = await selectByTextStable("#Amphur", amphurName, 8000);
+    if (amphurResult.kind !== "found") {
       skipped.push(
-        { field: "amphur", reason: `lookup_timeout:${amphurLookup.waitedMs}ms:${amphurName}` },
+        { field: "amphur", reason: `lookup_timeout:${amphurResult.waitedMs}ms:${amphurName}` },
         { field: "tumbol", reason: "skipped_dependency" },
       );
       return;
     }
-    setSelectViaJQuery(document.querySelector("#Amphur"), amphurLookup.value);
     filled.push("amphur");
 
     if (!tumbolName) {
       skipped.push({ field: "tumbol", reason: "no_data" });
       return;
     }
-    const tumbolLookup = await waitAndLookup("#Tumbol", tumbolName, 6000);
-    if (tumbolLookup.kind !== "found") {
+    // Committing the amphur above fired #Amphur's change → RVP loads its tambon
+    // list; poll until tumbolName lands.
+    const tumbolResult = await selectByTextStable("#Tumbol", tumbolName, 8000);
+    if (tumbolResult.kind !== "found") {
       skipped.push({
         field: "tumbol",
-        reason: `lookup_timeout:${tumbolLookup.waitedMs}ms:${tumbolName}`,
+        reason: `lookup_timeout:${tumbolResult.waitedMs}ms:${tumbolName}`,
       });
       return;
     }
-    setSelectViaJQuery(document.querySelector("#Tumbol"), tumbolLookup.value);
     filled.push("tumbol");
   }
 
@@ -813,6 +950,8 @@ async function runPRBFlow(payload) {
         );
         return;
       }
+      // Same default-load settle gate as the current-address block.
+      await waitForChildStable("#NAmphur", 5000);
       setSelectViaJQuery(cw, nChangwatCode);
       filled.push("nChangwat");
     } catch (e) {
@@ -831,30 +970,28 @@ async function runPRBFlow(payload) {
       );
       return;
     }
-    const nAmphurLookup = await waitAndLookup("#NAmphur", nAmphurName, 6000);
-    if (nAmphurLookup.kind !== "found") {
+    const nAmphurResult = await selectByTextStable("#NAmphur", nAmphurName, 8000);
+    if (nAmphurResult.kind !== "found") {
       skipped.push(
-        { field: "nAmphur", reason: `lookup_timeout:${nAmphurLookup.waitedMs}ms:${nAmphurName}` },
+        { field: "nAmphur", reason: `lookup_timeout:${nAmphurResult.waitedMs}ms:${nAmphurName}` },
         { field: "nTumbol", reason: "skipped_dependency" },
       );
       return;
     }
-    setSelectViaJQuery(document.querySelector("#NAmphur"), nAmphurLookup.value);
     filled.push("nAmphur");
 
     if (!nTumbolName) {
       skipped.push({ field: "nTumbol", reason: "no_data" });
       return;
     }
-    const nTumbolLookup = await waitAndLookup("#NTumbol", nTumbolName, 6000);
-    if (nTumbolLookup.kind !== "found") {
+    const nTumbolResult = await selectByTextStable("#NTumbol", nTumbolName, 8000);
+    if (nTumbolResult.kind !== "found") {
       skipped.push({
         field: "nTumbol",
-        reason: `lookup_timeout:${nTumbolLookup.waitedMs}ms:${nTumbolName}`,
+        reason: `lookup_timeout:${nTumbolResult.waitedMs}ms:${nTumbolName}`,
       });
       return;
     }
-    setSelectViaJQuery(document.querySelector("#NTumbol"), nTumbolLookup.value);
     filled.push("nTumbol");
   }
 }
