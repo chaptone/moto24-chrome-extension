@@ -10,6 +10,8 @@
 // Popup state persists via chrome.storage.session (schema unchanged).
 
 importScripts("scripts/run-prb-flow.js");
+// flow ที่สอง: ต่อภาษีออนไลน์ (eservice.dlt.go.th) — ทั้งหมดอยู่ใต้ scripts/dlt/ · ไฟล์นี้แค่ส่ง message ต่อ
+importScripts("scripts/dlt/lib.js", "scripts/dlt/orchestrator.js");
 
 const STATE_KEY = "prbState";
 
@@ -49,6 +51,16 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       if (message?.type === "GET_EXTENSION_VERSION") {
         const version = chrome.runtime.getManifest().version;
         sendResponse({ success: true, version });
+        return;
+      }
+      if (message?.type === "FILL_DLT_TAX" || message?.type === "GET_DLT_TAX_RESULT") {
+        // ⚠️ try แยก — ห้ามไหลไป catch ด้านล่างที่เขียน prbState/badge ของบอท พ.ร.บ.
+        try {
+          // eslint-disable-next-line no-undef
+          sendResponse(await handleDltExternalMessage(message));
+        } catch (err) {
+          sendResponse({ success: false, error: String(err) });
+        }
         return;
       }
       if (message?.type !== "FILL_PRB") {

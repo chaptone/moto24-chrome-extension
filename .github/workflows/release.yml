@@ -15,13 +15,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test (node --test) — แดง = ไม่ออก release
+        run: node --test "test/**/*.test.js"
+
       - name: Build zip
         run: bash scripts/build-zip.sh
 
       - name: Verify zip exists
         run: |
           ls -lh dist/moto24-prb-extension.zip
-          unzip -l dist/moto24-prb-extension.zip | head -20
+          unzip -l dist/moto24-prb-extension.zip | head -30
+          for f in lib orchestrator relay steps; do
+            unzip -l dist/moto24-prb-extension.zip | grep -q "scripts/dlt/$f.js" || { echo "ขาด scripts/dlt/$f.js"; exit 1; }
+          done
+          if unzip -l dist/moto24-prb-extension.zip | grep -q "/test/"; then echo "เทสต์หลุดเข้า zip"; exit 1; fi
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

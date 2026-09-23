@@ -1,10 +1,11 @@
 {
   "name": "moto24-chrome-extension",
-  "version": "0.6.0",
+  "version": "0.11.0",
   "description": "Chrome MV3 extension that auto-fills RVP ePolicy พรบ form for Moto24's registration tracking pipeline",
   "private": true,
   "scripts": {
-    "zip": "bash scripts/build-zip.sh"
+    "zip": "bash scripts/build-zip.sh",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "repository": {
     "type": "git",

@@ -50,6 +50,7 @@ Officer clicks "กรอก พรบ" on moto24's `/registration-tracking` row
 - `scripts/run-prb-flow.js` — page-injected function (must be self-contained — Chrome calls `.toString()` on it). Fills 18 RVP fields with two-tier verify.
 - `scripts/detect-page.js` — URL classifier (`login`, `form`, `unknown`).
 - `popup/` — browser-action popup. Renders state from `chrome.storage.session`. `field-labels.js` is duplicated from moto24's `tracking-row.tsx` — keep in sync (cross-reference comment in both).
+- `scripts/dlt/` — second flow (**ต่อภาษีออนไลน์**, `FILL_DLT_TAX` / `GET_DLT_TAX_RESULT`, 0.11.0+). `lib.js` = pure helpers + the ONLY place allowed to click/dispatch (`safeClick` / `setInputValue`, both refuse `FORBIDDEN_TARGETS`) + the run-state reducer · `orchestrator.js` = service-worker controller (state in `chrome.storage.local`, one run per browser) · `relay.js` = ISOLATED bridge (page → service worker) · `steps.js` = per-page steps + banner in MAIN world. `service-worker.js` only forwards the two message types; the `FILL_PRB` path is untouched. Tests: `node --test "test/**/*.test.js"` (also gates `release.yml`).
 
 ## Versioning
 
@@ -57,6 +58,7 @@ Officer clicks "กรอก พรบ" on moto24's `/registration-tracking` row
 - **Tag** matches manifest version with `v` prefix (`v0.5.0`).
 - moto24's `REQUIRED_EXTENSION_VERSION` is bumped when payload contract or critical behavior changes.
 - Bump manifest version FIRST, commit, then `git tag vX.Y.Z && git push --tags` — GH Actions builds the zip and publishes the GitHub Release.
+- The DLT flow has its **own** gate in moto24 (`REQUIRED_DLT_TAX_EXTENSION_VERSION`, 0.11.0). Bumping it never forces the PRB bot's `REQUIRED_EXTENSION_VERSION`, and vice versa.
 
 ## Critical implementation notes (from prior incidents)
 
@@ -68,6 +70,7 @@ These all caused real bugs during P1/P3 development. Don't reintroduce them:
 4. **Field ordering matters on RVP.** Setting `#MARQUE` resets `#CarColor`. Setting `#CarType` clobbers `#CarSize`. Selecting Tumbol auto-fills Zipcode. Read the comments in `run-prb-flow.js` before reordering anything.
 5. **PDPA modal `×` button is disabled.** Click `#imgEvent > img` instead.
 6. **`externally_connectable.matches` must cover the whole moto24 origin** (`/*`), not just the trigger route. Chrome grants the binding at document load time based on the URL at that moment, and Next.js soft-nav doesn't re-grant.
+7. **The DLT flow injects `lib.js` + `steps.js` as FILES into the MAIN world on purpose** — it never reads the return value of that injection (note 1's trap), then calls the step through a `func:` that only touches `window.__moto24DltSteps`. `steps.js` is scanned by `test/dlt/steps-scan.test.js`: no `.click(` / `dispatchEvent(` / `.trigger(` outside `lib.js`, and no forbidden id referenced. Never weaken that test to make a change pass.
 
 ## Stable extension ID
 

@@ -2,7 +2,10 @@
 
 Chrome MV3 extension that auto-fills the RVP ePolicy พรบ form for [Moto24](https://moto24.roodee.io/registration-tracking)'s registration tracking pipeline.
 
-The extension is a thin shell — all field-mapping and BC-data resolution lives in the private moto24 repo. This extension receives a payload via `chrome.runtime.sendMessage`, opens the RVP form, fills 18 fields, and reports back.
+The extension is a thin shell with **two flows**, both fed by the private moto24 repo:
+
+1. **`FILL_PRB`** — opens the RVP ePolicy form, fills 18 fields, and reports back (unchanged since 0.10.x).
+2. **`FILL_DLT_TAX`** (0.11.0+) — opens the Department of Land Transport e-Service (`eservice.dlt.go.th`), registers the vehicle in the officer's own logged-in account (trying at most two owner names), presses that vehicle's "pay tax" button, and reads what the site says on the tax page. **It never accepts the agreement, submits, or pays** — the officer does every confirming click. Progress and the site's messages are kept in `chrome.storage.local` for at most 24 hours and returned to moto24 via `GET_DLT_TAX_RESULT`.
 
 ## For officers
 
@@ -20,6 +23,14 @@ This is a public-source repo for an internal tool. See [`CLAUDE.md`](CLAUDE.md) 
 pnpm zip
 # → produces dist/moto24-prb-extension-v<version>.zip
 ```
+
+### Run the tests
+
+```bash
+node --test "test/**/*.test.js"   # or: pnpm test
+```
+
+The release workflow runs the same command before building the zip — a red test means no release.
 
 ### Cut a new release
 
