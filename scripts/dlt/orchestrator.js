@@ -7,6 +7,8 @@
 //     (ทุกอย่างภายใน esv02i001 เป็น AJAX — ขั้นในหน้ารอผลเอง ไม่ได้พึ่ง onUpdated · spike S3)
 //   • ขั้นในหน้ารายงานผ่าน relay.js → chrome.runtime.onMessage (DLT_EVENT)
 //   • ครั้งละ 1 รอบต่อเบราว์เซอร์ · ปิดแท็บ ⇒ aborted · เงียบ 30 นาที ⇒ timeout · เก็บผล 24 ชม. แล้วลบ
+//   • 🔒 รอบ v2 ที่ไปถึงหน้ายื่นภาษีแล้ว ปิดด้วยทางไหนก็ตามได้ ready_to_submit (สเปก 2026-10-15 §6.3) —
+//     บังคับใน settleFinal ของ lib.js ⇒ ทางปิดรอบใหม่ต้องผ่าน dltRecord(final) เสมอ ห้ามเขียน result เอง
 // ⛔ ไม่แตะสาย FILL_PRB — service-worker.js ส่งต่อมาเฉพาะ FILL_DLT_TAX / GET_DLT_TAX_RESULT
 // ⚠️ ฟังก์ชันระดับบนสุดขึ้นต้น dlt ทั้งหมด (อยู่ scope เดียวกับ service-worker.js — กันชื่อชน)
 
@@ -115,6 +117,14 @@ async function dltFinishAndShow(runId, tabId, outcome) {
   if (ended) await dltRunInPage(tabId, runId, "showFinal").catch(() => {});
 }
 
+function dltUrlPath(url) {
+  try {
+    return new URL(url).pathname;
+  } catch (e) {
+    return "?";
+  }
+}
+
 async function dltOnTabComplete(tabId, url) {
   const run = await dltCurrentRun();
   if (!run || run.result || run.tabId !== tabId) return;
@@ -123,16 +133,19 @@ async function dltOnTabComplete(tabId, url) {
 
   const visited = await dltRecord(run.runId, { type: "visit", kind });
   if (!visited || visited.result) return;
-
+  // รอบ v2 ผ่าน prb_ok แล้ว (รอ/กรอกหน้าที่อยู่ได้ถึง 20 นาที) แต่แท็บโหลดหน้าอื่นเต็มหน้า (ย้อนไปลงทะเบียน ·
+  // reload ไปหน้า agreement · login ใหม่) ⇒ ห้าม dispatch ขั้นเก่าซ้ำ (บอทจะกรอก/กดบนเว็บกรมอีกรอบ)
+  // ปิดรอบเป็น unexpected_page — settleFinal แปลงเป็น ready_to_submit + address page_changed (§6.3)
   const phase = DLT.PHASE_BY_KIND[kind];
+  if (visited.reachedReady && kind !== "tax_form") {
+    // หน้าที่ไม่รู้จัก ⇒ ใส่ pathname ไว้ไล่ปัญหา เหมือนทาง unexpected_page:<path> (final review m-8)
+    await dltRecord(run.runId, { type: "note", event: "left_tax_form:" + kind + (phase ? "" : ":" + dltUrlPath(url)) });
+    await dltFinishAndShow(run.runId, tabId, "unexpected_page");
+    return;
+  }
+
   if (!phase) {
-    let path = "?";
-    try {
-      path = new URL(url).pathname;
-    } catch (e) {
-      path = "?";
-    }
-    await dltRecord(run.runId, { type: "note", event: "unexpected_page:" + path });
+    await dltRecord(run.runId, { type: "note", event: "unexpected_page:" + dltUrlPath(url) });
     await dltFinishAndShow(run.runId, tabId, "unexpected_page");
     return;
   }

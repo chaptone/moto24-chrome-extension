@@ -50,7 +50,9 @@ test("setInputValue ตั้งค่า + ยิง input/change/blur · ป�
   assert.equal(L.setInputValue(input, "1ทด"), "1ทด");
   // blur ต้องมี: add_plate2 ของกรมค้นรถใน onblur (PrimeFaces.ab e:'blur') — ไม่ blur = กรมตอบ "ไม่พบข้อมูลรถ" ทุกคัน (QA 2026-09-23)
   assert.deepEqual(input.events, ["input", "change", "blur"]);
-  assert.throws(() => L.setInputValue(el("editPage2_sendFname"), "x"), /ห้ามแตะ/);
+  // นามสกุลไม่อยู่ใน allowlist (สเปก 2026-10-15 §7 — บอทไม่แตะ) · ชื่ออยู่ใน allowlist แล้ว
+  assert.throws(() => L.setInputValue(el("editPage2_sendLname"), "x"), /ห้ามแตะ/);
+  assert.equal(L.setInputValue(el("editPage2_sendFname"), "x"), "x");
 });
 
 test("classifyDltMessage — 4 ประเภท", () => {
@@ -150,4 +152,64 @@ test("hasMorePages — จากจำนวนลิงก์หน้า + ส
 
 test("LIMITS เท่ากับ DLT_RESULT_LIMITS ของ moto24 (KEEP-IN-SYNC)", () => {
   assert.deepEqual({ ...L.LIMITS }, { text: 2000, short: 200, dltMessages: 50, timeline: 200, nameAttempts: 20, fieldList: 50 });
+});
+
+test("allowlist editPage2_ (สเปก 2026-10-15 §7): ช่องที่อยู่ที่อนุญาตแตะได้ แม้อยู่ใต้ grid ที่ไม่อยู่ใน allowlist", () => {
+  const grid = el("editPage2_editActAdd3Grid");
+  for (const id of [
+    "editPage2_sendFname",
+    "editPage2_addrNo",
+    "editPage2_sendZipCode",
+    "editPage2_sendPhoneNo",
+    "editPage2_sendEmail",
+    "editPage2_sendLocCodeProvince_sendLocCodeProvince_input",
+    "editPage2_sendLocCodeAmphur_sendLocCodeAmphur_input",
+    "editPage2_sendLocCode_sendLocCode_input",
+    "editPage2_sendAddType_3",
+  ]) {
+    assert.equal(L.isForbiddenTarget(el(id, grid)), false, id);
+  }
+  // กล่อง radio ไม่มี id — บรรพบุรุษใกล้สุดที่ขึ้นต้น editPage2_ คือตาราง radio
+  assert.equal(L.isForbiddenTarget(el("", el("", el("editPage2_sendAddType", grid)))), false);
+  // รายการ autocomplete ใน panel ของช่องที่อนุญาต
+  assert.equal(L.isForbiddenTarget(el("", el("editPage2_sendLocCodeProvince_sendLocCodeProvince_panel"))), false);
+});
+
+test("allowlist editPage2_: ที่เหลือยังห้าม — ปุ่ม · dialog · นามสกุล/ถนน · id ที่คล้ายแต่ไม่ใช่", () => {
+  for (const id of [
+    "editPage2_payBtn",
+    "editPage2_backBtn",
+    "editPage2_sendLname",
+    "editPage2_sendStreet",
+    "editPage2_sendLocCodeX",
+    "editPage2_sendFnameX",
+    "editPage2_anything",
+  ]) {
+    assert.equal(L.isForbiddenTarget(el(id)), true, id);
+  }
+  // ช่องที่อนุญาตแต่อยู่ใน dialog ⇒ ห้าม (dialog ของ editPage2 เป็นของคนทั้งหมด)
+  assert.equal(L.isForbiddenTarget(el("editPage2_sendEmail", el("editPage2_checkEmailDialog"))), true);
+  for (const id of [
+    "editPage2_payBtn",
+    "editPage2_backBtn",
+    "editPage2_confirmReqEmailBtn",
+    "editPage2_confirmCheckEmailBtn",
+    "editPage2_declineCheckEmailBtn",
+    "editPage2_consent",
+    "editPage2_confirmRecallBtn",
+    "editPage2_confirmDeclineBtn",
+    "editPage2_backToAlertRecallBtn",
+  ]) {
+    assert.ok(L.FORBIDDEN_TARGETS.includes(id), id);
+    assert.throws(() => L.safeClick(el("inner", el(id))), /ห้ามกด/, id);
+  }
+});
+
+test("isAllowedEditPage2Id — ฐาน หรือ ฐาน + _ / :", () => {
+  assert.equal(L.isAllowedEditPage2Id("editPage2_sendAddType"), true);
+  assert.equal(L.isAllowedEditPage2Id("editPage2_sendAddType:3"), true);
+  assert.equal(L.isAllowedEditPage2Id("editPage2_sendLocCode_sendLocCode_panel"), true);
+  assert.equal(L.isAllowedEditPage2Id("editPage2_sendLocCodeProvince"), true);
+  assert.equal(L.isAllowedEditPage2Id("editPage2_sendLocCodeZ"), false);
+  assert.equal(L.isAllowedEditPage2Id("editPage2_payBtn"), false);
 });

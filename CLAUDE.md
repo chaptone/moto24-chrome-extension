@@ -50,7 +50,7 @@ Officer clicks "กรอก พรบ" on moto24's `/registration-tracking` row
 - `scripts/run-prb-flow.js` — page-injected function (must be self-contained — Chrome calls `.toString()` on it). Fills 18 RVP fields with two-tier verify.
 - `scripts/detect-page.js` — URL classifier (`login`, `form`, `unknown`).
 - `popup/` — browser-action popup. Renders state from `chrome.storage.session`. `field-labels.js` is duplicated from moto24's `tracking-row.tsx` — keep in sync (cross-reference comment in both).
-- `scripts/dlt/` — second flow (**ต่อภาษีออนไลน์**, `FILL_DLT_TAX` / `GET_DLT_TAX_RESULT`, 0.11.0+). `lib.js` = pure helpers + the ONLY place allowed to click/dispatch (`safeClick` / `setInputValue`, both refuse `FORBIDDEN_TARGETS`) + the run-state reducer · `orchestrator.js` = service-worker controller (state in `chrome.storage.local`, one run per browser) · `relay.js` = ISOLATED bridge (page → service worker) · `steps.js` = per-page steps + banner in MAIN world. `service-worker.js` only forwards the two message types; the `FILL_PRB` path is untouched. Tests: `node --test "test/**/*.test.js"` (also gates `release.yml`).
+- `scripts/dlt/` — second flow (**ต่อภาษีออนไลน์**, `FILL_DLT_TAX` / `GET_DLT_TAX_RESULT`, 0.11.0+). `lib.js` = pure helpers + the ONLY place allowed to click/dispatch (`safeClick` / `setInputValue`, both refuse `FORBIDDEN_TARGETS`) + the run-state reducer · `orchestrator.js` = service-worker controller (state in `chrome.storage.local`, one run per browser) · `relay.js` = ISOLATED bridge (page → service worker) · `steps.js` = per-page steps + banner in MAIN world. `service-worker.js` only forwards the two message types; the `FILL_PRB` path is untouched. Tests: `node --test "test/**/*.test.js"` (also gates `release.yml`). · 0.12.0+: after the DLT confirms the PRB, the bot waits (≤ 20 min) for the officer to open the delivery-address page (`editPage2`, AJAX in the same URL) and fills it from `payload.delivery` (v2) — `editPage2_` is an **allowlist** in `lib.js`, not a blanket ban; payment/back buttons and every `editPage2` dialog stay forbidden. 🔒 A v2 run that reached the tax form always ends `ready_to_submit` (`settleFinal` in the reducer); why the address part ended lives in `result.address`. Every per-field decision (overwrite / cascade / DLT-filled postal code / dialog stop) is a pure function in `lib.js` tested in `test/dlt/address.test.js`; `steps.js` only reads, fills and reports.
 
 ## Versioning
 
@@ -58,7 +58,7 @@ Officer clicks "กรอก พรบ" on moto24's `/registration-tracking` row
 - **Tag** matches manifest version with `v` prefix (`v0.5.0`).
 - moto24's `REQUIRED_EXTENSION_VERSION` is bumped when payload contract or critical behavior changes.
 - Bump manifest version FIRST, commit, then `git tag vX.Y.Z && git push --tags` — GH Actions builds the zip and publishes the GitHub Release.
-- The DLT flow has its **own** gate in moto24 (`REQUIRED_DLT_TAX_EXTENSION_VERSION`, 0.11.0). Bumping it never forces the PRB bot's `REQUIRED_EXTENSION_VERSION`, and vice versa.
+- The DLT flow has its **own** gate in moto24 (`REQUIRED_DLT_TAX_EXTENSION_VERSION`, 0.12.0). Bumping it never forces the PRB bot's `REQUIRED_EXTENSION_VERSION`, and vice versa.
 
 ## Critical implementation notes (from prior incidents)
 

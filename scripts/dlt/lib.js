@@ -9,11 +9,16 @@
 //    (test/dlt/steps-scan.test.js) · บอทกรอก คนกดยืนยัน: รายการปุ่มที่ห้ามกดอยู่ใน FORBIDDEN_TARGETS
 // ⛔ PUBLIC REPO: ห้ามมีชื่อบริษัท ชื่อลูกค้า ทะเบียนรถจริง ในไฟล์นี้และในเทสต์ (ชื่อบริษัทมากับ payload)
 //
-// สัญญากับ moto24: lib/renewal-tracking/dlt-tax-types.ts — KEEP-IN-SYNC: version · resultVersion · LIMITS
-// @typedef {{ version: 1, runId: string, display: { customer: string, plate: string },
+// สัญญากับ moto24: lib/renewal-tracking/dlt-tax-types.ts — KEEP-IN-SYNC: version · resultVersion · LIMITS ·
+//   ADDRESS_MAXLEN · normText (= dltFieldText) · dltPhoneDigits · ADDRESS_NOT_READY
+// @typedef {{ kind: "branch"|"home", recipientName: string, addressLine: string, subDistrict: string,
+//   district: string, province: string, postalCode: string, phone: string|null, email: string|null }
+//   | { kind: "none", reason: "no_branch_address"|"no_home_address" }} DltDelivery
+// @typedef {{ version: 1|2, runId: string, display: { customer: string, plate: string },
 //   vehicleTypeLabel: string, provinceLabel: string|null, plate1: string, plate2: string,
 //   ownerNames: { value: string, source: "company"|"customer" }[], mileage: string|null,
-//   ours: { expiryDate: string|null, jobType: string } }} DltTaxPayloadV1
+//   ours: { expiryDate: string|null, jobType: string }, delivery?: DltDelivery }} DltTaxPayload
+//   (delivery มีเฉพาะ version 2 — สเปก 2026-10-15 §6.1 · v1 = moto24 ก่อน 0.12 ยังรับ ทำงานแบบเดิม)
 
 (function (root) {
   "use strict";
@@ -25,20 +30,46 @@
   /** ต้องเท่ากับ DLT_RESULT_LIMITS ของ moto24 — ข้อความยาวกว่านี้ถูกตัดก่อนส่ง */
   const LIMITS = Object.freeze({ text: 2000, short: 200, dltMessages: 50, timeline: 200, nameAttempts: 20, fieldList: 50 });
 
-  /** ปุ่ม/ช่องที่บอทห้ามกดหรือแตะ (spec §6.7) — ตรวจทั้งตัวมันและบรรพบุรุษ */
+  /** ปุ่ม/ช่องที่บอทห้ามกดหรือแตะ (spec §6.7 + สเปก 2026-10-15 §7) — ตรวจทั้งตัวมันและบรรพบุรุษ */
   const FORBIDDEN_TARGETS = Object.freeze([
     "info_submitBtn", // ยอมรับข้อตกลง
     "info_checkEmailAgreementBtn", // ตกลง ของ dialog แจ้งอีเมล
     "info_backBtn", // ปฏิเสธข้อตกลง
-    "editPage1_edit2Btn", // กรอกสถานที่จัดส่งเอกสาร (⚠️ ไม่ใช่ edit1Btn)
+    "editPage1_edit2Btn", // กรอกสถานที่จัดส่งเอกสาร (⚠️ ไม่ใช่ edit1Btn) — คนกดไปหน้าที่อยู่เอง
     "editPage1_alertFoundOicBtn", // ตกลง ของ dialog ผล พ.ร.บ.
     "editPage1_policyFlag", // radio พ.ร.บ. ทั้งกลุ่ม (ค่า 4/5 = ซื้อ = เงิน)
     "editPage1_baceBtn", // ย้อนกลับ
     "search_srsRegistrantRemoveListTableBtn", // ยกเลิกลงทะเบียนรถ
     "result_confirmRemoveListBtn", // ยืนยันยกเลิกลงทะเบียน
+    "editPage2_payBtn", // เลือกวิธีการชำระเงิน
+    "editPage2_backBtn", // ย้อนกลับ
+    "editPage2_confirmReqEmailBtn",
+    "editPage2_confirmCheckEmailBtn", // ยืนยัน e-mail รับใบเสร็จ
+    "editPage2_declineCheckEmailBtn", // ตรวจสอบข้อมูล
+    "editPage2_consent", // radio ยินยอม (dialog recall)
+    "editPage2_confirmRecallBtn",
+    "editPage2_confirmDeclineBtn",
+    "editPage2_backToAlertRecallBtn",
   ]);
-  /** ทุกอย่างในหน้าที่อยู่จัดส่ง/ชำระเงิน */
-  const FORBIDDEN_PREFIXES = Object.freeze(["editPage2_"]);
+  /** หน้าที่อยู่จัดส่ง (editPage2_) — **allowlist** (สเปก 2026-10-15 §7): แตะได้เฉพาะช่องเหล่านี้
+   *  id ของช่อง = ฐาน หรือ ฐาน + "_…"/":…" (input/hinput/panel ของ autocomplete · radio รายตัว)
+   *  ทุกอย่างอื่นที่ขึ้นต้น editPage2_ ห้าม · ทุกอย่างใน dialog (`editPage2_…Dialog`) ห้ามแม้ id อยู่ใน allowlist */
+  const EDITPAGE2_PREFIX = "editPage2_";
+  const EDITPAGE2_ALLOWED_BASES = Object.freeze([
+    "editPage2_sendAddType", // radio ที่อยู่ — บอทเลือกได้เฉพาะ 5 อื่นๆ (steps.js)
+    "editPage2_sendFname", // ชื่อ
+    "editPage2_addrNo", // เลขที่บ้าน
+    "editPage2_sendLocCodeProvince", // จังหวัด
+    "editPage2_sendLocCodeAmphur", // เขต/อำเภอ
+    "editPage2_sendLocCode", // แขวง/ตำบล
+    "editPage2_sendZipCode", // รหัสไปรษณีย์
+    "editPage2_sendPhoneNo", // เบอร์โทรศัพท์ติดต่อ
+    "editPage2_sendEmail", // E-mail
+  ]);
+
+  function isAllowedEditPage2Id(id) {
+    return EDITPAGE2_ALLOWED_BASES.some((b) => id === b || id.startsWith(b + "_") || id.startsWith(b + ":"));
+  }
 
   const OUTCOME_TEXT = Object.freeze({
     ready_to_submit: "ถึงหน้ายื่นภาษีแล้ว",
@@ -66,14 +97,23 @@
     return (el && (el.id || el.tagName)) || "?";
   }
 
+  /** ห้ามถ้า: (1) ตัวมันหรือบรรพบุรุษอยู่ใน FORBIDDEN_TARGETS · (2) อยู่ใน dialog ของ editPage2 ·
+   *  (3) id ใกล้สุดที่ขึ้นต้น editPage2_ ไม่อยู่ใน allowlist (container ไกลกว่านั้น เช่น editActAdd3Grid ไม่นับ) */
   function isForbiddenTarget(el) {
     let node = el;
+    let nearestPage2 = null;
     for (let depth = 0; node && depth < 40; depth++) {
       const id = typeof node.id === "string" ? node.id : "";
-      if (id && (FORBIDDEN_TARGETS.includes(id) || FORBIDDEN_PREFIXES.some((p) => id.startsWith(p)))) return true;
+      if (id) {
+        if (FORBIDDEN_TARGETS.includes(id)) return true;
+        if (id.startsWith(EDITPAGE2_PREFIX)) {
+          if (/Dialog$/.test(id)) return true;
+          if (nearestPage2 === null) nearestPage2 = id;
+        }
+      }
       node = node.parentElement;
     }
-    return false;
+    return nearestPage2 !== null && !isAllowedEditPage2Id(nearestPage2);
   }
 
   /** คลิกที่มีด่าน — ของต้องห้าม ⇒ throw (ขั้นที่เรียกจับแล้วจบรอบ bot_error + แบนเนอร์ ไม่เดินต่อเงียบ ๆ) */
@@ -272,10 +312,28 @@
     tax_form: "runTaxForm",
   });
 
+  const DELIVERY_TEXT_FIELDS = ["recipientName", "addressLine", "subDistrict", "district", "province", "postalCode"];
+
+  /** delivery ของ payload v2 (สเปก 2026-10-15 §6.1) */
+  function validateDelivery(d) {
+    if (!d || typeof d !== "object") return "ไม่มีข้อมูลที่อยู่จัดส่ง (delivery)";
+    if (d.kind === "none") {
+      return d.reason === "no_branch_address" || d.reason === "no_home_address" ? null : "delivery.reason ไม่ถูกต้อง";
+    }
+    if (d.kind !== "branch" && d.kind !== "home") return "delivery.kind ไม่ถูกต้อง";
+    for (const k of DELIVERY_TEXT_FIELDS) {
+      if (typeof d[k] !== "string" || !d[k].trim()) return "ที่อยู่จัดส่งไม่ครบ (" + k + ")";
+    }
+    for (const k of ["phone", "email"]) {
+      if (d[k] !== null && typeof d[k] !== "string") return "ที่อยู่จัดส่งไม่ถูกต้อง (" + k + ")";
+    }
+    return null;
+  }
+
   /** ตรวจ payload จาก moto24 ซ้ำฝั่ง extension — 🔒 ชื่อ 1–2 ชื่อ (spec D2) */
   function validatePayload(p) {
     if (!p || typeof p !== "object") return "payload ว่าง";
-    if (p.version !== 1) return "payload version ไม่รองรับ (ต้องเป็น 1) — อัปเดต extension หรือ moto24";
+    if (p.version !== 1 && p.version !== 2) return "payload version ไม่รองรับ (ต้องเป็น 1 หรือ 2) — อัปเดต extension หรือ moto24";
     if (typeof p.runId !== "string" || !p.runId || p.runId.length > 64) return "ไม่มี runId";
     if (typeof p.plate1 !== "string" || !p.plate1 || typeof p.plate2 !== "string" || !/^\d{1,4}$/.test(p.plate2)) return "ทะเบียนไม่ครบ";
     if (typeof p.vehicleTypeLabel !== "string" || !p.vehicleTypeLabel) return "ไม่มีประเภทรถ";
@@ -287,7 +345,246 @@
       }
     }
     if (!p.display || typeof p.display.plate !== "string" || typeof p.display.customer !== "string") return "ไม่มีข้อมูลหัวแบนเนอร์";
+    if (p.version === 2) {
+      const bad = validateDelivery(p.delivery);
+      if (bad) return bad;
+    }
     return null;
+  }
+
+  // ── ส่วนที่อยู่ของ result v2 (สเปก 2026-10-15 §6.2–6.3) ──────────────────────────────────
+
+  /** address.reason ของรอบที่ไม่เคยถึงหน้ายื่นภาษี · 🔒 KEEP-IN-SYNC: DLT_ADDRESS_NOT_READY ของ moto24 */
+  const ADDRESS_NOT_READY = "not_ready";
+  const ADDRESS_STATUSES = Object.freeze(["filled", "partial", "not_reached", "skipped"]);
+  /** phase จากหน้าที่แปลว่ารอบผ่าน prb_ok แล้ว (I4 — ห้ามพึ่ง ready_reached ตัวเดียว: relay ยิงแล้วลืมอาจหล่น) */
+  const PAST_READY_PHASES = Object.freeze(["waiting_address", "filling_address"]);
+  /** outcome ที่ SW/หน้าขอปิดรอบ → address.reason เมื่อรอบไปถึงหน้ายื่นภาษีแล้ว */
+  const NOT_REACHED_REASON = Object.freeze({
+    aborted: "aborted",
+    superseded: "superseded",
+    timeout: "timeout",
+    unexpected_page: "page_changed",
+    bot_error: "bot_error",
+    prb_not_found: "page_changed",
+    dlt_blocked: "page_changed",
+    name_rejected: "page_changed",
+  });
+
+  function emptyAddress(status, reason) {
+    return { status, reason: reason == null ? null : reason, filled: [], skipped: [], dltZip: null, notes: [] };
+  }
+
+  /** address จากหน้า — status ไม่รู้จัก ⇒ null (ทิ้ง) · ตัดตาม LIMITS */
+  function sanitizeAddress(a) {
+    if (!a || typeof a !== "object" || !ADDRESS_STATUSES.includes(a.status)) return null;
+    const arr = (x) => (Array.isArray(x) ? x : []);
+    return {
+      status: a.status,
+      reason: a.reason == null ? null : clip(a.reason, LIMITS.short),
+      filled: arr(a.filled).slice(0, LIMITS.fieldList).map((f) => clip(f, LIMITS.short)),
+      skipped: arr(a.skipped)
+        .filter((s) => s && typeof s.field === "string")
+        .slice(0, LIMITS.fieldList)
+        .map((s) => ({ field: clip(s.field, LIMITS.short), reason: clip(s.reason, LIMITS.short), value: s.value == null ? null : clip(s.value, LIMITS.text) })),
+      dltZip: a.dltZip == null || a.dltZip === "" ? null : clip(a.dltZip, LIMITS.short),
+      notes: arr(a.notes).slice(0, LIMITS.fieldList).map((n) => clip(n, LIMITS.text)),
+    };
+  }
+
+  /** 🔒 กติกาเหล็ก (สเปก 2026-10-15 §6.3 · Ruling R8): รอบ v2 ที่ไปถึงหน้ายื่นภาษีแล้ว (reachedReady)
+   *  จบด้วยอะไรก็ตาม ⇒ outcome ready_to_submit · เหตุที่รอบจบไปอยู่ที่ address.reason
+   *  ทุกทางที่ปิดรอบ (หน้าเอง · dltOnTabRemoved · supersede ใน handleDltExternalMessage · dltSweep ·
+   *  unexpected_page · dltFailCurrent) เข้ามาที่ applyDltEvent(final) ⇒ บังคับที่นี่ที่เดียว
+   *  คืน { outcome, address (undefined = payload v1), error (เฉพาะ outcome bot_error จริง) } */
+  function settleFinal(run, outcome, error) {
+    if (!run.payload || run.payload.version !== 2) return { outcome, address: undefined, error };
+    if (!run.reachedReady) return { outcome, address: emptyAddress("not_reached", ADDRESS_NOT_READY), error };
+    const fallbackReason = outcome === "ready_to_submit" ? "no_report" : NOT_REACHED_REASON[outcome] || outcome;
+    const address = JSON.parse(JSON.stringify(run.address || emptyAddress("not_reached", fallbackReason)));
+    // R7: ถึงหน้ายื่นภาษีแล้ว address ห้ามเป็น not_reached/not_ready (หน้ารายงานผิดก็ไม่ให้ขัดสัญญา)
+    if (address.status === "not_reached" && address.reason === ADDRESS_NOT_READY) address.reason = fallbackReason;
+    if (outcome === "bot_error" && error && address.notes.length < LIMITS.fieldList) {
+      address.notes.push(clip("bot_error: " + error, LIMITS.text));
+    }
+    return { outcome: "ready_to_submit", address, error: undefined };
+  }
+
+  // ── แผนกรอกหน้าที่อยู่ (editPage2) — บริสุทธิ์ · steps.js ทำตามทีละช่อง (สเปก 2026-10-15 §7 ข้อ 3) ──
+
+  /** maxlength ของกรม (วัด 2026-10-15) · 🔒 KEEP-IN-SYNC: DLT_ADDRESS_MAXLEN ใน moto24 dlt-tax-types.ts */
+  const ADDRESS_MAXLEN = Object.freeze({ recipientName: 60, addressLine: 20 });
+  /** value ของ radio "อื่นๆ" ใน editPage2_sendAddType (1 สมาชิก · 2 จัดส่งเอกสาร · 4 ล่าสุด · 5 อื่นๆ — วัด 2026-10-15) */
+  const ADDRESS_OTHER_VALUE = "5";
+  /** ป้ายตามหน้ากรม — ใช้ในแบนเนอร์ */
+  const ADDRESS_FIELD_TEXT = Object.freeze({
+    recipientName: "ชื่อ",
+    addressLine: "เลขที่บ้าน",
+    province: "จังหวัด",
+    district: "เขต/อำเภอ",
+    subDistrict: "แขวง/ตำบล",
+    postalCode: "รหัสไปรษณีย์",
+    phone: "เบอร์โทรศัพท์ติดต่อ",
+    email: "E-mail",
+  });
+  const ADDRESS_SKIP_TEXT = Object.freeze({
+    too_long: "ยาวเกินช่องของกรม",
+    option_missing: "ไม่พบในรายการของกรม",
+    cascade_stopped: "ช่องก่อนหน้าเลือกไม่ติด",
+    invalid_phone: "รูปแบบเบอร์ใช้ไม่ได้",
+    officer_filled: "มีค่าอยู่แล้ว บอทไม่เขียนทับ",
+    no_data: "ระบบไม่มีข้อมูล",
+    selector_missing: "หาช่องไม่เจอ",
+    value_mismatch: "ค่าไม่ติด",
+    dialog_open: "กรมเปิดกล่องข้อความ",
+  });
+  const ADDRESS_NOT_REACHED_TEXT = Object.freeze({
+    timeout: "รอหน้าที่อยู่เกินเวลา — กรอกที่อยู่เอง",
+    aborted: "ปิดแท็บก่อนกรอกที่อยู่",
+    superseded: "มีการสั่งงานใหม่จาก moto24 — ที่อยู่ยังไม่ได้กรอก แท็บนี้ไม่ถูกติดตามแล้ว",
+    page_changed: "ออกจากหน้ายื่นภาษีก่อนกรอกที่อยู่ — กรอกที่อยู่เอง",
+    bot_error: "บอทขัดข้องก่อนกรอกที่อยู่ — กรอกที่อยู่เอง",
+  });
+
+  /** 🔒 KEEP-IN-SYNC: dltPhoneDigits ของ moto24 (เวกเตอร์เทสต์ชุดเดียวกัน) */
+  function dltPhoneDigits(raw) {
+    if (raw == null) return null;
+    const s = String(raw).replace(/[-\s]/g, "");
+    return /^\d{9,10}$/.test(s) ? s : null;
+  }
+
+  function planAddressFill(delivery) {
+    const d = delivery || {};
+    const text = (k) => normText(d[k]);
+    const limited = (key) => {
+      const value = text(key);
+      return value.length <= ADDRESS_MAXLEN[key] ? { key, value } : { key, skip: "too_long", value };
+    };
+    const phone = dltPhoneDigits(d.phone);
+    const email = text("email");
+    const zip = text("postalCode");
+    return {
+      recipientName: limited("recipientName"),
+      addressLine: limited("addressLine"),
+      cascade: [
+        { key: "province", value: text("province") },
+        { key: "district", value: text("district") },
+        { key: "subDistrict", value: text("subDistrict") },
+      ],
+      postalCode: zip ? { key: "postalCode", value: zip } : { key: "postalCode", skip: "no_data", value: null },
+      phone: phone
+        ? { key: "phone", value: phone }
+        : d.phone
+          ? { key: "phone", skip: "invalid_phone", value: String(d.phone) }
+          : { key: "phone", skip: "no_data", value: null },
+      email: email ? { key: "email", value: email } : { key: "email", skip: "no_data", value: null },
+    };
+  }
+
+  /** ช่องข้อความ: แผนสั่งเว้น ⇒ เว้น · มีค่าเท่าที่จะกรอกอยู่แล้ว (รันซ้ำ / กด "ตรวจสอบข้อมูล" แล้วกลับมา)
+   *  ⇒ { already } นับว่ากรอกแล้ว ไม่เขียนซ้ำ · มีค่าอื่น (คนกรอกก่อน) ⇒ ไม่เขียนทับ · ว่าง ⇒ กรอก */
+  function textFillDecision(current, planned) {
+    if (planned.skip) return { skip: planned.skip, value: planned.value };
+    const before = normText(current);
+    if (before && before === normText(planned.value)) return { already: true, value: planned.value };
+    if (before) return { skip: "officer_filled", value: before };
+    return { fill: planned.value };
+  }
+
+  /** ก่อนเลือกช่องหนึ่งในทอด จังหวัด→อำเภอ→ตำบล · combo = { shown, hidden } ของ autocomplete (null = หา widget ไม่เจอ)
+   *  broken = ช่องก่อนหน้าในทอดไม่ติด ⇒ ช่องลูกกรองตามช่องแม่ เลือกต่อไม่ได้ (§3.1)
+   *  stop = ช่องถัดไปในทอดต้องไม่เลือกต่อ (คนเลือกค่าอื่นไว้ ⇒ ค่าของเราเป็นของอีกจังหวัด/อำเภอ)
+   *  ข้อความตรงแต่ hidden ว่าง = พิมพ์ค้างไม่ได้เลือกจากรายการ (กรม LovRequired) ⇒ ของคน ไม่นับว่ากรอกแล้ว */
+  function cascadeFillDecision(broken, combo, planned) {
+    const want = normText(planned.value);
+    if (!combo) return broken ? { skip: "cascade_stopped", value: planned.value } : { skip: "selector_missing", value: planned.value, stop: true };
+    const shown = normText(combo.shown);
+    if (shown) {
+      return shown === want && normText(combo.hidden) !== "" ? { already: true, value: planned.value } : { skip: "officer_filled", value: shown, stop: true };
+    }
+    if (broken) return { skip: "cascade_stopped", value: planned.value };
+    if (!want) return { skip: "no_data", value: null, stop: true };
+    return { select: planned.value };
+  }
+
+  /** เหตุที่ selectAutocomplete พิมพ์ข้อความลง _input/_hinput ไปแล้วแต่เลือกไม่ติด */
+  const CASCADE_TYPED_REASONS = Object.freeze(["option_missing", "value_mismatch"]);
+  const CASCADE_KEYS = Object.freeze(["province", "district", "subDistrict"]);
+
+  /** หลัง selectAutocomplete ของช่องในทอด — ไม่ติด ⇒ เหตุจากการเลือก + ค่าที่ลอง (§7 ข้อ 3.4) แล้วหยุดทอด
+   *  clear = บอทพิมพ์ลงช่องไปแล้ว ⇒ steps ต้องคืน _input/_hinput ให้ว่าง (final review I-1: ช่องที่เลือกไม่ติดต้อง *ดู* ว่าง
+   *  ไม่ใช่ดูครบ · ปลอดภัยต่อ "ไม่เขียนทับของคน" เพราะ cascadeFillDecision สั่งเลือกเฉพาะเมื่อช่องว่างอยู่แล้ว) */
+  function cascadeResultDecision(res, planned) {
+    if (res && res.ok) return { filled: true };
+    const reason = (res && res.reason) || "value_mismatch";
+    const d = { skip: reason, value: planned.value, stop: true };
+    if (CASCADE_TYPED_REASONS.includes(reason)) d.clear = true;
+    return d;
+  }
+
+  /** ทอด จังหวัด→อำเภอ→ตำบล มีช่องที่ไม่ได้ค่าจากรายการ (บอทเลือกไม่ติด / ถูกหยุดต่อ) — ช่องที่คนเลือกเองไม่นับ */
+  function cascadeIncomplete(skipped) {
+    return (skipped || []).some((s) => s && CASCADE_KEYS.includes(s.field) && s.reason !== "officer_filled");
+  }
+
+  /** รหัสไปรษณีย์ — กรมเติมเองทันทีที่เลือกตำบล (§3.1) ⇒ ถ้าตำบลเป็นของเราและช่องมีค่า ใช้ของกรม (dltZip)
+   *  พร้อม note เมื่อไม่ตรงของเรา · ห้ามตัดสินด้วย textFillDecision ในกรณีนี้ (ค่าของกรมจะกลายเป็น officer_filled)
+   *  ทอดเลือกไม่ครบ (cascadeBroken — L.cascadeIncomplete) + ช่องว่าง ⇒ ไม่เติมของเรา (cascade_stopped · final review I-1):
+   *  ปล่อยให้กรมเติมเองตอนคนเลือกตำบล — รหัสไปรษณีย์ของเราบนทอดที่ขาดทำให้หน้ากรมดูเหมือนกรอกครบ
+   *  ตำบลไม่ใช่ของเรา / กรมไม่เติม ⇒ กติกาช่องข้อความปกติ */
+  function zipFillDecision(current, subDistrictOurs, planned, cascadeBroken) {
+    const now = normText(current);
+    if (subDistrictOurs && now) return { dlt: now, note: zipDiffNote(now, planned.value) };
+    if (cascadeBroken && !now && !planned.skip) return { skip: "cascade_stopped", value: planned.value };
+    return textFillDecision(current, planned);
+  }
+
+  /** dialog ของ editPage2 โผล่ระหว่างกรอก ⇒ หยุดกรอก: ช่องที่เหลือ dialog_open + note (Ruling R9) · ไม่มี ⇒ null
+   *  บอทไม่แตะอะไรใน dialog เลย (lib.isForbiddenTarget) — คนอ่านแล้วตัดสินใจเอง */
+  function addressDialogStop(openIds, remainingKeys) {
+    if (!openIds || !openIds.length) return null;
+    return {
+      note: "dlt_dialog:" + openIds.join(","),
+      skipped: (remainingKeys || []).map((field) => ({ field, reason: "dialog_open", value: null })),
+    };
+  }
+
+  /** radio ที่อยู่: คนเลือกแบบอื่นไว้แล้ว ⇒ ไม่แตะ (Ruling R4) · ไม่มีตัว "อื่นๆ" ⇒ หน้าเปลี่ยน */
+  function addressRadioDecision(selected, hasOther) {
+    if (selected && selected !== ADDRESS_OTHER_VALUE) return "officer_chose_other";
+    if (!hasOther) return "page_changed";
+    return selected === ADDRESS_OTHER_VALUE ? "already_other" : "click_other";
+  }
+
+  function zipDiffNote(dltZip, ours) {
+    const d = normText(dltZip);
+    const o = normText(ours);
+    return d && o && d !== o ? "zip_differs:" + o : null;
+  }
+
+  /** filled = ไม่มีช่องที่เว้น ยกเว้น no_data (เบอร์/อีเมลที่ระบบไม่มี — Ruling R3)
+   *  และไม่มี dialog ของกรมโผล่ระหว่าง/หลังกรอก (note dlt_dialog: — Ruling R9 ⇒ partial เสมอ) */
+  function addressStatusOf(skipped, notes) {
+    if ((notes || []).some((n) => String(n).indexOf("dlt_dialog:") === 0)) return "partial";
+    return (skipped || []).some((s) => s.reason !== "no_data") ? "partial" : "filled";
+  }
+
+  /** บรรทัด "เหลือให้ทำเอง" ของแบนเนอร์ — ไม่ใส่ค่าในช่อง (ข้อมูลลูกค้า) */
+  function describeAddressSkips(address) {
+    const skipped = address && Array.isArray(address.skipped) ? address.skipped : [];
+    return skipped.map((s) => {
+      const field = ADDRESS_FIELD_TEXT[s.field] || s.field;
+      const why = ADDRESS_SKIP_TEXT[s.reason] || s.reason;
+      const max = s.reason === "too_long" && ADDRESS_MAXLEN[s.field] ? " " + ADDRESS_MAXLEN[s.field] + " ตัว" : "";
+      // เบอร์ไม่บังคับบนหน้ากรม ⇒ ไม่มีเบอร์ = เว้นได้ (ตรงกับการ์ด moto24 "ไม่มีเบอร์ — เว้นว่าง")
+      if (s.field === "phone" && s.reason === "no_data") return field + ": ระบบไม่มีเบอร์ — เว้นว่างได้";
+      const tail = s.reason === "officer_filled" ? " — ตรวจเอง" : " — กรอกเอง";
+      return field + ": " + why + max + tail;
+    });
+  }
+
+  function addressNotReachedText(reason) {
+    return ADDRESS_NOT_REACHED_TEXT[reason] || "ไม่ได้กรอกที่อยู่ — กรอกเอง";
   }
 
   function newRun(input) {
@@ -305,11 +602,13 @@
       dltMessages: [],
       dltSays: {},
       timeline: [{ at: input.nowIso, phase: "starting", event: "start" }],
+      reachedReady: false, // ผ่าน prb_ok แล้ว — ready_reached / phase รอ-กรอกที่อยู่ / address / final ready_to_submit (payload v2 เท่านั้น)
+      address: null, // ผลส่วนที่อยู่ล่าสุดที่หน้ารายงาน
       result: null,
     };
   }
 
-  const PAGE_EVENT_TYPES = Object.freeze(["phase", "heartbeat", "note", "name_attempt", "registration", "dlt_message", "fields", "dlt_says", "final"]);
+  const PAGE_EVENT_TYPES = Object.freeze(["phase", "heartbeat", "note", "name_attempt", "registration", "dlt_message", "fields", "dlt_says", "ready_reached", "address", "final"]);
 
   /** เหตุการณ์จากหน้า (ผ่าน relay) — whitelist ชนิด · visit มาจาก service worker เท่านั้น */
   function sanitizeEvent(ev) {
@@ -328,6 +627,8 @@
       case "dlt_message": return "dlt_message:" + ev.kind;
       case "final": return "final:" + ev.outcome;
       case "note": return "note:" + ev.event;
+      case "ready_reached": return "ready_reached";
+      case "address": return "address:" + (ev.address && ev.address.status ? clip(ev.address.status, LIMITS.short) : "?");
       default: return ev.type;
     }
   }
@@ -347,6 +648,8 @@
     }
     for (const [k, v] of Object.entries(ev.values || {})) {
       const key = clip(k, LIMITS.short);
+      // policyFlag อ่านซ้ำได้ "" บนหน้าที่ไม่มี radio พ.ร.บ. (final review m-2) ⇒ ไม่ทับค่าที่อ่านไว้
+      if (key === "policyFlag" && v === "" && target.values[key]) continue;
       if (key in target.values || Object.keys(target.values).length < LIMITS.fieldList) target.values[key] = clip(v, LIMITS.text);
     }
   }
@@ -358,14 +661,15 @@
   function mergeSays(target, ev) {
     if (ev.taxExpiry) target.taxExpiry = saysDate(ev.taxExpiry);
     if (ev.nextTaxExpiry) target.nextTaxExpiry = saysDate(ev.nextTaxExpiry);
-    if (Array.isArray(ev.amounts)) target.amounts = ev.amounts.slice(0, 10).map((a) => ({ label: clip(a.label, LIMITS.short), raw: clip(a.raw, LIMITS.short) }));
+    // อ่านซ้ำบนหน้าที่ไม่มียอด (เช่น โหลดหน้าที่อยู่เต็มหน้า — final review m-2) ⇒ ไม่ล้างยอดที่อ่านไว้
+    if (Array.isArray(ev.amounts) && (ev.amounts.length || !Array.isArray(target.amounts))) target.amounts = ev.amounts.slice(0, 10).map((a) => ({ label: clip(a.label, LIMITS.short), raw: clip(a.raw, LIMITS.short) }));
     if (ev.prbInfo) target.prbInfo = clip(ev.prbInfo, LIMITS.text);
     if (ev.siteVersion) target.siteVersion = clip(ev.siteVersion, LIMITS.short);
   }
 
-  function buildDltResult(run, outcome, error) {
+  function buildDltResult(run, outcome, error, address) {
     const r = {
-      resultVersion: 1,
+      resultVersion: address ? 2 : 1,
       outcome,
       fields: run.fields,
       nameAttempts: run.nameAttempts,
@@ -374,6 +678,7 @@
       dltSays: run.dltSays,
       timeline: run.timeline,
     };
+    if (address) r.address = address;
     if (error) r.error = clip(error, LIMITS.text);
     return JSON.parse(JSON.stringify(r));
   }
@@ -384,9 +689,11 @@
     const next = JSON.parse(JSON.stringify(run));
     next.updatedAt = nowIso;
     if (ev.type === "heartbeat") return next;
+    const isV2 = !!next.payload && next.payload.version === 2;
 
     if (ev.type === "phase" && typeof ev.phase === "string") {
       next.phase = clip(ev.phase, LIMITS.short);
+      if (isV2 && PAST_READY_PHASES.includes(next.phase)) next.reachedReady = true;
     } else if (ev.type === "visit") {
       next.visits[ev.kind] = (next.visits[ev.kind] || 0) + 1;
     } else if (ev.type === "name_attempt") {
@@ -408,6 +715,14 @@
       if (next.dltMessages.length < LIMITS.dltMessages) {
         next.dltMessages.push({ page: clip(ev.page, LIMITS.short), kind: clip(ev.kind, LIMITS.short), text: clip(ev.text, LIMITS.text), at: nowIso });
       }
+    } else if (ev.type === "ready_reached") {
+      if (isV2) next.reachedReady = true;
+    } else if (ev.type === "address") {
+      if (isV2) {
+        next.reachedReady = true; // หน้ารายงานส่วนที่อยู่ได้แปลว่าผ่าน prb_ok แล้ว (I4) — แม้ตัวผลจะใช้ไม่ได้
+        const a = sanitizeAddress(ev.address);
+        if (a) next.address = a;
+      }
     } else if (ev.type === "fields") {
       mergeFields(next.fields, ev);
     } else if (ev.type === "dlt_says") {
@@ -419,7 +734,16 @@
 
     if (ev.type === "final") {
       next.phase = "done";
-      next.result = buildDltResult(next, ev.outcome, ev.error);
+      if (isV2 && ev.outcome === "ready_to_submit") next.reachedReady = true; // หน้าบอกเองว่าถึงแล้ว (I4)
+      // final review m-6: หน้าพก address มากับ final ด้วย (event address แยกอาจหล่น/มาหลัง final ผ่าน relay)
+      // ใช้ได้ ⇒ ใช้ตัวนี้ · ใช้ไม่ได้ ⇒ คงตัวที่มาแยก · ผ่าน settleFinal เหมือนเดิม ⇒ §6.3/R7 ไม่หลุด · v1 ละ (R6)
+      if (isV2 && ev.address) {
+        next.reachedReady = true; // เหมือน event address (I4)
+        const a = sanitizeAddress(ev.address);
+        if (a) next.address = a;
+      }
+      const settled = settleFinal(next, ev.outcome, ev.error);
+      next.result = buildDltResult(next, settled.outcome, settled.error, settled.address);
     }
     return next;
   }
@@ -436,6 +760,8 @@
     URLS,
     LIMITS,
     FORBIDDEN_TARGETS,
+    EDITPAGE2_ALLOWED_BASES,
+    isAllowedEditPage2Id,
     OUTCOME_TEXT,
     OUTCOMES,
     normText,
@@ -458,6 +784,27 @@
     PHASE_BY_KIND,
     STEP_BY_KIND,
     validatePayload,
+    ADDRESS_NOT_READY,
+    ADDRESS_STATUSES,
+    emptyAddress,
+    sanitizeAddress,
+    settleFinal,
+    ADDRESS_MAXLEN,
+    ADDRESS_OTHER_VALUE,
+    ADDRESS_FIELD_TEXT,
+    dltPhoneDigits,
+    planAddressFill,
+    textFillDecision,
+    cascadeFillDecision,
+    cascadeResultDecision,
+    cascadeIncomplete,
+    zipFillDecision,
+    addressDialogStop,
+    addressRadioDecision,
+    zipDiffNote,
+    addressStatusOf,
+    describeAddressSkips,
+    addressNotReachedText,
     newRun,
     sanitizeEvent,
     applyDltEvent,

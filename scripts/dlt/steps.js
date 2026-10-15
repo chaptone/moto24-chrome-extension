@@ -34,6 +34,25 @@
     ["editPage1_ptmAmt", "ค่าปรับใบสั่ง"],
     ["editPage1_total", "รวม"],
   ];
+  // หน้าที่อยู่จัดส่ง (editPage2 — AJAX ใน URL เดิมของ esv02i002) · สเปก 2026-10-15 §3.1 · §7
+  const ADDRESS_WAIT_MS = 20 * 60 * 1000; // session กรมหมดราว 24 นาที (วัด QA 0.11.0)
+  const ADDR_TEXT_ID = {
+    recipientName: "editPage2_sendFname",
+    addressLine: "editPage2_addrNo",
+    postalCode: "editPage2_sendZipCode",
+    phone: "editPage2_sendPhoneNo",
+    email: "editPage2_sendEmail",
+  };
+  const ADDR_WIDGET = {
+    province: "widget_editPage2_sendLocCodeProvince_sendLocCodeProvince",
+    district: "widget_editPage2_sendLocCodeAmphur_sendLocCodeAmphur",
+    subDistrict: "widget_editPage2_sendLocCode_sendLocCode",
+  };
+  const ADDRESS_TITLE = {
+    filled: "บอทกรอกที่อยู่ครบ — ตรวจแล้วทำต่อเอง",
+    partial: "บอทกรอกที่อยู่บางช่อง — ที่เหลือทำเอง",
+    skipped: "บอทไม่ได้กรอกที่อยู่ — ทำต่อเอง",
+  };
   const TONES = {
     info: ["#eff6ff", "#3b82f6"],
     wait: ["#fefce8", "#eab308"],
@@ -166,6 +185,14 @@
   function widget(widgetVar) {
     const pf = window.PrimeFaces;
     return pf && pf.widgets ? pf.widgets[widgetVar] || null : null;
+  }
+
+  /** คืน _input/_hinput ของ autocomplete ให้ว่าง — ใช้เฉพาะช่องที่บอทเพิ่งพิมพ์แล้วเลือกไม่ติด (L.cascadeResultDecision.clear) */
+  function clearCombo(widgetVar) {
+    const w = widget(widgetVar);
+    if (!w || !w.input || !w.hinput) return;
+    w.input.val("");
+    w.hinput.val("");
   }
 
   function comboState(widgetVar) {
@@ -317,8 +344,12 @@
     }
   }
 
-  function finish(ctx, view, outcome, error) {
-    post(ctx, error ? { type: "final", outcome, error } : { type: "final", outcome });
+  /** address = ผลส่วนที่อยู่ (payload v2) — พกไปกับ final ด้วย กัน event address แยกหล่นผ่าน relay (final review m-6) */
+  function finish(ctx, view, outcome, error, address) {
+    const ev = { type: "final", outcome };
+    if (error) ev.error = error;
+    if (address) ev.address = address;
+    post(ctx, ev);
     view.tone = OUTCOME_TONE[outcome] || "info";
     view.title = "บอทจบรอบ: " + (L.OUTCOME_TEXT[outcome] || outcome);
     if (error) view.notes.push("ข้อผิดพลาด: " + error);
@@ -740,6 +771,253 @@
     return state;
   }
 
+  // ── esv02i002 หน้าที่อยู่จัดส่ง (editPage2) — สเปก 2026-10-15 §7 ─────────────────────────────
+  // การตัดสินทุกช่องอยู่ใน lib.js (บริสุทธิ์ · test/dlt/address.test.js) — ตรงนี้อ่านหน้า/กรอก/จดผลเท่านั้น
+
+  /** รอเจ้าหน้าที่กด ตกลง → กรอกสถานที่จัดส่งเอกสาร (ปุ่มนั้นเป็นของคน — editPage1_edit2Btn ห้ามกด)
+   *  เป็น AJAX ใน URL เดิม ⇒ tabs.onUpdated ไม่เห็น · poll เอง ≤ 20 นาที */
+  async function waitForAddressPage(ctx) {
+    post(ctx, { type: "phase", phase: "waiting_address" });
+    const deadline = Date.now() + ADDRESS_WAIT_MS;
+    let lastBeat = Date.now();
+    while (Date.now() < deadline) {
+      ensureNotStopped();
+      if (isVisible(byId("editPage2_sendAddType"))) return true;
+      if (Date.now() - lastBeat > HEARTBEAT_MS) {
+        post(ctx, { type: "heartbeat" });
+        lastBeat = Date.now();
+      }
+      await sleep(500);
+    }
+    return false;
+  }
+
+  /** radio ที่อยู่ — อ่านอย่างเดียว · other = ตัวเลือกค่า 5 (อื่นๆ) ตัวเดียวที่บอทกดได้ */
+  function addressRadioState() {
+    const inputs = Array.from(document.querySelectorAll('input[name="editPage2_sendAddType"]'));
+    const other = inputs.find((i) => i.value === L.ADDRESS_OTHER_VALUE) || null;
+    const checked = inputs.find((i) => i.checked);
+    return { other, selected: checked ? checked.value : null };
+  }
+
+  function newAddressDraft() {
+    return { status: "partial", reason: null, filled: [], skipped: [], dltZip: null, notes: [] };
+  }
+
+  function skipAddr(a, field, reason, value) {
+    a.skipped.push({ field, reason, value: value == null ? null : String(value) });
+  }
+
+  /** ทำตามคำตัดสินของช่องข้อความ (textFillDecision / zipFillDecision ที่ไม่ใช่ค่าของกรม) */
+  function applyTextDecision(a, el, key, d) {
+    if (d.skip) {
+      skipAddr(a, key, d.skip, d.value);
+      return;
+    }
+    if (d.already) {
+      a.filled.push(key); // ค่าเดียวกับที่จะกรอกอยู่แล้ว (รันซ้ำ / กลับจาก "ตรวจสอบข้อมูล") — ไม่เขียนซ้ำ
+      return;
+    }
+    const got = L.normText(setValue(el, d.fill));
+    if (got === L.normText(d.fill)) a.filled.push(key);
+    else skipAddr(a, key, "value_mismatch", got);
+  }
+
+  function fillAddressText(a, planned) {
+    const el = byId(ADDR_TEXT_ID[planned.key]);
+    if (!el && !planned.skip) {
+      skipAddr(a, planned.key, "selector_missing", planned.value);
+      return;
+    }
+    applyTextDecision(a, el, planned.key, L.textFillDecision(el ? el.value : "", planned));
+  }
+
+  /** จังหวัด → อำเภอ → ตำบล ด้วยท่า ①′ (selectAutocomplete) · ช่องลูกกรองตามช่องแม่
+   *  ⇒ ช่องไหนไม่ติด ช่องที่เหลือ cascade_stopped (ตัดสินใน L.cascadeFillDecision / L.cascadeResultDecision)
+   *  เช็ก dialog ของกรมก่อนทุกช่อง (การเลือกแต่ละช่องยิง AJAX) · คืน true เมื่อหยุดเพราะ dialog (R9) */
+  async function fillAddressCascade(a, cascade, laterKeys) {
+    let broken = false;
+    for (let i = 0; i < cascade.length; i++) {
+      const c = cascade[i];
+      ensureNotStopped();
+      if (stopIfAddressDialog(a, cascade.slice(i).map((x) => x.key).concat(laterKeys))) return true;
+      const d = L.cascadeFillDecision(broken, comboState(ADDR_WIDGET[c.key]), c);
+      if (d.stop) broken = true;
+      if (d.already) {
+        a.filled.push(c.key);
+        continue;
+      }
+      if (d.skip) {
+        skipAddr(a, c.key, d.skip, d.value);
+        continue;
+      }
+      const r = L.cascadeResultDecision(await selectAutocomplete(ADDR_WIDGET[c.key], d.select), c);
+      if (r.filled) {
+        a.filled.push(c.key);
+      } else {
+        if (r.clear) clearCombo(ADDR_WIDGET[c.key]); // ช่องที่เลือกไม่ติดต้องดูว่าง (final review I-1)
+        skipAddr(a, c.key, r.skip, r.value);
+        broken = true;
+      }
+    }
+    return false;
+  }
+
+  /** กรมเติมรหัสไปรษณีย์เองหลังเลือกตำบล ⇒ ใช้ของกรม (+ note ถ้าไม่ตรงของเรา) · ไม่เติม ⇒ ใส่ของเรา */
+  async function fillAddressZip(a, planned) {
+    await waitAjaxIdle();
+    const el = byId(ADDR_TEXT_ID.postalCode);
+    if (!el) {
+      skipAddr(a, planned.key, "selector_missing", planned.value);
+      return;
+    }
+    const d = L.zipFillDecision(el.value, a.filled.includes("subDistrict"), planned, L.cascadeIncomplete(a.skipped));
+    if (d.dlt) {
+      a.dltZip = d.dlt;
+      a.filled.push(planned.key);
+      if (d.note) a.notes.push(d.note);
+      return;
+    }
+    applyTextDecision(a, el, planned.key, d);
+  }
+
+  /** dialog ของกรม (editPage2_…Dialog) เปิดอยู่ ⇒ หยุดกรอก ช่องที่เหลือ dialog_open (Ruling R9) · คืน true เมื่อหยุด */
+  function stopIfAddressDialog(a, remainingKeys) {
+    const stop = L.addressDialogStop(visibleDialogIds("editPage2_"), remainingKeys);
+    if (!stop) return false;
+    a.notes.push(stop.note);
+    for (const s of stop.skipped) a.skipped.push(s);
+    return true;
+  }
+
+  /** กรอกตามลำดับ §7 ข้อ 3 — ไม่เขียนทับของคน · radio ของคนไม่แตะ (R4) · dialog ของกรมโผล่ ⇒ หยุดกรอก (R9) */
+  async function fillAddressPage(ctx, a) {
+    const plan = L.planAddressFill(ctx.payload.delivery);
+    const stages = [
+      [["recipientName"], () => fillAddressText(a, plan.recipientName)],
+      [["addressLine"], () => fillAddressText(a, plan.addressLine)],
+      [["province", "district", "subDistrict"], () => fillAddressCascade(a, plan.cascade, keysFrom(3))],
+      [["postalCode"], () => fillAddressZip(a, plan.postalCode)],
+      [["phone"], () => fillAddressText(a, plan.phone)],
+      [["email"], () => fillAddressText(a, plan.email)],
+    ];
+    const keysFrom = (i) => stages.slice(i).reduce((all, st) => all.concat(st[0]), []);
+    const finishStatus = () => {
+      a.status = L.addressStatusOf(a.skipped, a.notes);
+    };
+
+    await waitAjaxIdle(); // หน้าที่อยู่เพิ่งเปิดด้วย AJAX ⇒ รอให้ว่างก่อนอ่าน/คลิก radio (final review m-3)
+    if (stopIfAddressDialog(a, keysFrom(0))) {
+      finishStatus();
+      return;
+    }
+    const radio = addressRadioState();
+    const decision = L.addressRadioDecision(radio.selected, !!radio.other);
+    if (decision === "officer_chose_other" || decision === "page_changed") {
+      a.status = "skipped";
+      a.reason = decision;
+      return;
+    }
+    if (decision === "click_other") {
+      // กดได้เฉพาะกล่องของ radio ค่า 5 (อื่นๆ) — ไม่แตะตัวเลือกอื่นของกลุ่ม แม้ lib allowlist จะเปิดทั้งกลุ่ม
+      const holder = radio.other.value !== L.ADDRESS_OTHER_VALUE ? null : radio.other.closest(".ui-radiobutton");
+      const box = holder ? holder.querySelector(".ui-radiobutton-box") : null;
+      if (!box) {
+        a.status = "skipped";
+        a.reason = "page_changed";
+        return;
+      }
+      click(box, { jquery: true });
+      await waitAjaxIdle();
+      if (addressRadioState().selected !== L.ADDRESS_OTHER_VALUE) {
+        a.status = "skipped";
+        a.reason = "page_changed";
+        return;
+      }
+    }
+    if (!byId(ADDR_TEXT_ID.recipientName)) {
+      a.status = "skipped";
+      a.reason = "page_changed";
+      return;
+    }
+    for (let i = 0; i < stages.length; i++) {
+      ensureNotStopped();
+      if (stopIfAddressDialog(a, keysFrom(i))) break;
+      if (await stages[i][1]()) break; // หยุดกลางขั้น (dialog ระหว่างทอดจังหวัด→อำเภอ→ตำบล)
+    }
+    await waitAjaxIdle();
+    // dialog ที่เปิดหลังช่องสุดท้าย (เช่น กรอก E-mail แล้วกรมเปิดกล่องขออีเมล) ⇒ จด note · สถานะ partial (R9)
+    if (!a.notes.some((n) => n.indexOf("dlt_dialog:") === 0)) stopIfAddressDialog(a, []);
+    finishStatus();
+  }
+
+  function showAddressOutcome(view, a) {
+    view.title = ADDRESS_TITLE[a.status] || ADDRESS_TITLE.partial;
+    if (a.status !== "filled") view.tone = "warn"; // ครบ = ok ตาม finish(ready_to_submit) · ไม่ครบ = ต้องให้คนดู
+    if (a.filled.length) view.done.push("กรอกที่อยู่แล้ว: " + a.filled.map((k) => L.ADDRESS_FIELD_TEXT[k] || k).join(" · "));
+    if (a.reason === "officer_chose_other") view.notes.push("เจ้าหน้าที่เลือกที่อยู่แบบอื่นไว้แล้ว — บอทไม่แตะหน้าที่อยู่");
+    if (a.reason === "page_changed") view.notes.push("หน้าที่อยู่ของกรมไม่ตรงกับที่บอทรู้จัก — กรอกเอง");
+    if (a.reason === "bot_error") view.notes.push("บอทขัดข้องระหว่างกรอก — ตรวจทุกช่องเอง");
+    if (a.notes.some((n) => n.indexOf("dlt_dialog:") === 0)) view.notes.push("กรมเปิดกล่องข้อความระหว่างกรอก — บอทหยุดกรอก อ่านแล้วตัดสินใจเอง");
+    if (a.notes.some((n) => n.indexOf("zip_differs:") === 0)) view.notes.push("รหัสไปรษณีย์ที่กรมเติมไม่ตรงกับในระบบ — ใช้ของกรม ตรวจอีกครั้ง");
+    view.todo = L.describeAddressSkips(a).concat(["ตรวจที่อยู่ทุกช่อง แล้วกด เลือกวิธีการชำระเงิน → ยืนยัน e-mail เอง"]);
+  }
+
+  /** หลังกรมพบ พ.ร.บ. (payload v2) — สเปก 2026-10-15 §7 ข้อ 1–4
+   *  🔒 ready_reached ต้องโพสต์ก่อนทุกอย่าง ⇒ ถ้ารอบถูกปิดจากที่อื่นหลังจากนี้ (ปิดแท็บ · รอบใหม่ · sweep)
+   *  reducer ตัดสินเป็น ready_to_submit เสมอ (กติกาเหล็ก §6.3) · address รายงานครั้งเดียวตอนจบ (R5) */
+  async function runAddressStage(ctx, view) {
+    post(ctx, { type: "ready_reached" });
+    const d = ctx.payload.delivery || { kind: "none", reason: "no_branch_address" };
+    if (d.kind === "none") {
+      // ไม่แตะหน้าที่อยู่เลย — เหตุมาจาก payload (ร้านไม่มีที่อยู่สาขา / งานบ้านไม่มีที่อยู่)
+      const skipped = L.emptyAddress("skipped", d.reason);
+      post(ctx, { type: "address", address: skipped });
+      finish(ctx, view, "ready_to_submit", undefined, skipped);
+      view.tone = "warn"; // ที่อยู่ไม่ได้กรอก ⇒ ไม่ใช่สีเขียว (QA 2026-10-16 · ตรงกับ m-1)
+      view.title = "บอทหยุดตรงนี้ — ที่เหลือทำเอง";
+      view.todo = [
+        "กด ตกลง ที่กล่องข้อความของกรม",
+        d.reason === "no_home_address"
+          ? "กรอกสถานที่จัดส่งเอกสารเอง (งานนี้ไม่มีที่อยู่ส่งบ้าน)"
+          : "กรอกที่อยู่สาขาเอง (ระบบยังไม่มีที่อยู่สาขานี้)",
+        "เลือกช่องทางชำระเงิน",
+      ];
+      return;
+    }
+    view.tone = "wait";
+    view.title = "รอเจ้าหน้าที่ไปหน้าที่อยู่";
+    view.todo = ["กด ตกลง แล้วกด กรอกสถานที่จัดส่งเอกสาร — บอทจะกรอกที่อยู่ให้"];
+    renderBanner(view);
+    const arrived = await waitForAddressPage(ctx);
+    if (!arrived) {
+      const late = L.emptyAddress("not_reached", "timeout");
+      post(ctx, { type: "address", address: late });
+      finish(ctx, view, "ready_to_submit", undefined, late);
+      view.tone = "warn"; // ที่อยู่ไม่ได้กรอก ⇒ ไม่ใช่สีเขียว (final review m-1)
+      view.title = "ไม่ได้ไปหน้าที่อยู่ภายใน 20 นาที — ที่เหลือทำเอง";
+      view.todo = ["กรอกสถานที่จัดส่งเอกสารเอง", "เลือกช่องทางชำระเงิน"];
+      return;
+    }
+    post(ctx, { type: "phase", phase: "filling_address" });
+    view.tone = "info";
+    view.title = "บอทกำลังกรอกที่อยู่";
+    view.todo = [];
+    renderBanner(view);
+    const a = newAddressDraft();
+    try {
+      await fillAddressPage(ctx, a);
+    } catch (err) {
+      if (err instanceof StoppedError) throw err;
+      a.status = "partial";
+      a.reason = "bot_error";
+      a.notes.push("bot_error: " + errText(err));
+    }
+    post(ctx, { type: "address", address: a });
+    finish(ctx, view, "ready_to_submit", undefined, a);
+    showAddressOutcome(view, a);
+  }
+
   async function runTaxForm(ctx) {
     if (stopped()) return;
     const view = newView(ctx, "info", "บอทกำลังอ่านหน้ายื่นภาษี");
@@ -781,9 +1059,14 @@
       const verdict = L.classifyTaxFormDialogs(ids, flags);
       if (verdict === "prb_ok") {
         view.done.push("กรมพบ พ.ร.บ. — ทำรายการต่อได้");
-        finish(ctx, view, "ready_to_submit");
-        view.title = "บอทหยุดตรงนี้ — ที่เหลือทำเอง";
-        view.todo = ["กด ตกลง ที่กล่องข้อความของกรม", "กรอกสถานที่จัดส่งเอกสาร", "เลือกช่องทางชำระเงิน"];
+        if (ctx.payload.version !== 2) {
+          // payload v1 = moto24 ก่อน 0.12 (Ruling R6) — พฤติกรรมเดิมทุกอย่าง
+          finish(ctx, view, "ready_to_submit");
+          view.title = "บอทหยุดตรงนี้ — ที่เหลือทำเอง";
+          view.todo = ["กด ตกลง ที่กล่องข้อความของกรม", "กรอกสถานที่จัดส่งเอกสาร", "เลือกช่องทางชำระเงิน"];
+        } else {
+          await runAddressStage(ctx, view);
+        }
       } else if (verdict === "prb_not_found") {
         finish(ctx, view, "prb_not_found");
       } else if (verdict === "dlt_blocked") {
@@ -811,6 +1094,10 @@
     const view = newView(ctx, OUTCOME_TONE[outcome] || "info", "บอทจบรอบ: " + (outcome ? L.OUTCOME_TEXT[outcome] || outcome : "—"));
     if (outcome === "superseded") view.notes.push("มีการสั่งงานใหม่จาก moto24 — แท็บนี้ไม่ถูกติดตามแล้ว");
     if (outcome === "unexpected_page") view.notes.push("บอทไม่รู้จักหน้านี้ — ทำต่อเองได้ แล้วกลับไปรันบอทใหม่จาก moto24");
+    // รอบ v2 ที่ถึงหน้ายื่นภาษีแล้วถูกปิดจาก SW (รอบใหม่ · sweep · หลงหน้า) ⇒ ready_to_submit + เหตุใน address (§6.3)
+    const addr = r && r.address;
+    if (outcome === "ready_to_submit" && addr && addr.status === "not_reached") view.notes.push(L.addressNotReachedText(addr.reason));
+    if (outcome === "ready_to_submit" && addr && addr.status !== "filled") view.tone = "warn"; // final review m-1
     renderBanner(view);
   }
 

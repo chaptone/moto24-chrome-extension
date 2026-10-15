@@ -170,3 +170,154 @@ test("sweep: เงียบเกิน 30 นาที ⇒ timeout · จบ�
   assert.equal(store.dltCurrentRunId, undefined);
   assert.ok(calls.cleared >= 1);
 });
+
+// ── Task 9: กติกาเหล็ก §6.3 ระดับ orchestrator (Ruling R8) ─────────────────────────────
+
+const DELIVERY = { kind: "branch", recipientName: "ผู้รับสมมุติ", addressLine: "1/1", subDistrict: "ตำบลสมมุติ", district: "อำเภอสมมุติ", province: "จังหวัดสมมุติ", postalCode: "10000", phone: null, email: null };
+
+async function startV2(sw, runId) {
+  return j(await sw.handleDltExternalMessage({ type: "FILL_DLT_TAX", data: payload(runId, { version: 2, delivery: DELIVERY }) }));
+}
+
+/** หน้ายื่นภาษีพบ พ.ร.บ. แล้วกำลังรอคนกดไปหน้าที่อยู่ (สเปก 2026-10-15 §7 ข้อ 1–2) */
+async function waitingAddress(sw, runId, tabId) {
+  for (const event of [{ type: "ready_reached" }, { type: "phase", phase: "waiting_address" }]) {
+    await sw.dltOnRelayEvent({ type: "DLT_EVENT", runId, event }, { tab: { id: tabId } });
+  }
+}
+
+test("🔒 §6.3 dltOnTabRemoved: ปิดแท็บระหว่างรอหน้าที่อยู่ ⇒ ready_to_submit + not_reached/aborted", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await waitingAddress(sw, "r1", 100);
+  await sw.dltOnTabRemoved(100);
+  assert.equal(store["dltRun:r1"].result.outcome, "ready_to_submit");
+  assert.deepEqual([store["dltRun:r1"].result.address.status, store["dltRun:r1"].result.address.reason], ["not_reached", "aborted"]);
+});
+
+test("🔒 §6.3 supersede ใน handleDltExternalMessage: สั่งรอบใหม่ระหว่างรอ ⇒ รอบเก่า ready_to_submit + superseded", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await waitingAddress(sw, "r1", 100);
+  await startV2(sw, "r2");
+  assert.equal(store["dltRun:r1"].result.outcome, "ready_to_submit");
+  assert.equal(store["dltRun:r1"].result.address.reason, "superseded");
+  assert.equal(store.dltCurrentRunId, "r2");
+  // moto24 ดึงผลรอบเก่าได้ทันทีหลังสั่งรอบใหม่ (Ruling R1)
+  const old = j(await sw.handleDltExternalMessage({ type: "GET_DLT_TAX_RESULT", runId: "r1" }));
+  assert.equal(old.state, "final");
+  assert.equal(old.result.outcome, "ready_to_submit");
+});
+
+test("🔒 §6.3 dltSweep: เงียบเกิน 30 นาทีระหว่างรอ (หน้าตาย) ⇒ ready_to_submit + timeout", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await waitingAddress(sw, "r1", 100);
+  store["dltRun:r1"].updatedAt = new Date(Date.now() - 31 * 60000).toISOString();
+  await sw.dltSweep(Date.now());
+  assert.equal(store["dltRun:r1"].result.outcome, "ready_to_submit");
+  assert.equal(store["dltRun:r1"].result.address.reason, "timeout");
+});
+
+test("🔒 §6.3 unexpected_page: ออกจากหน้ายื่นภาษีระหว่างรอ ⇒ ready_to_submit + page_changed", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await waitingAddress(sw, "r1", 100);
+  await sw.dltOnTabComplete(100, "https://eservice.dlt.go.th/esvapp/esv/ebk/esv02q001/index.jsf");
+  assert.equal(store["dltRun:r1"].result.outcome, "ready_to_submit");
+  assert.equal(store["dltRun:r1"].result.address.reason, "page_changed");
+});
+
+test("รอบ v2 ที่ยังไม่ถึงหน้ายื่นภาษี ปิดแท็บ ⇒ aborted ตามเดิม (address not_ready)", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await sw.dltOnTabRemoved(100);
+  assert.equal(store["dltRun:r1"].result.outcome, "aborted");
+  assert.equal(store["dltRun:r1"].result.address.reason, "not_ready");
+});
+
+// I4 (controller): ready_reached หล่นระหว่าง relay ก็ต้องยังบังคับกติกาเหล็ก
+test("🔒 I4: ไม่มี ready_reached แต่มี phase waiting_address แล้วปิดแท็บ ⇒ ready_to_submit + not_reached/aborted", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await sw.dltOnRelayEvent({ type: "DLT_EVENT", runId: "r1", event: { type: "phase", phase: "waiting_address" } }, { tab: { id: 100 } });
+  await sw.dltOnTabRemoved(100);
+  assert.equal(store["dltRun:r1"].result.outcome, "ready_to_submit");
+  assert.deepEqual([store["dltRun:r1"].result.address.status, store["dltRun:r1"].result.address.reason], ["not_reached", "aborted"]);
+});
+
+test("🔒 I4: final ready_to_submit จากหน้าโดยไม่มี ready_reached/address ⇒ address not_reached/no_report (ผ่าน R7)", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await sw.dltOnRelayEvent({ type: "DLT_EVENT", runId: "r1", event: { type: "final", outcome: "ready_to_submit" } }, { tab: { id: 100 } });
+  const r = store["dltRun:r1"].result;
+  assert.equal(r.resultVersion, 2);
+  assert.equal(r.outcome, "ready_to_submit");
+  assert.deepEqual([r.address.status, r.address.reason], ["not_reached", "no_report"]);
+});
+
+// Fix round 1 (I-1): หลัง prb_ok รอบค้างได้ 20 นาที — โหลดหน้าเก่าเต็มหน้าต้องไม่สั่งบอทกรอก/กดซ้ำ
+const STEP_NAMES = ["onLoginPage", "runRegister", "onAgreementPage", "runTaxForm"];
+function dispatchedSteps(calls) {
+  return calls.exec.filter((o) => Array.isArray(o.args) && STEP_NAMES.includes(o.args[0])).map((o) => o.args[0]);
+}
+
+for (const [kind, url] of [
+  ["register", REGISTER],
+  ["agreement", "https://eservice.dlt.go.th/esvapp/esv/ebk/taxAgreement/index.jsf"],
+  ["login", "https://eservice.dlt.go.th/esvapp/login.jsf"],
+]) {
+  test("🔒 I-1: รอบ v2 ผ่าน prb_ok แล้ว แท็บโหลดหน้า " + kind + " ⇒ ไม่ dispatch ขั้นใหม่ · ready_to_submit + page_changed", async () => {
+    const { sw, store, calls } = boot();
+    await startV2(sw, "r1");
+    await waitingAddress(sw, "r1", 100);
+    const before = dispatchedSteps(calls).length;
+    await sw.dltOnTabComplete(100, url);
+    assert.equal(dispatchedSteps(calls).length, before, "ห้ามสั่งขั้นใหม่");
+    const r = store["dltRun:r1"].result;
+    assert.ok(r, "รอบต้องถูกปิด");
+    assert.equal(r.outcome, "ready_to_submit");
+    assert.equal(r.address.reason, "page_changed");
+  });
+}
+
+test("I-1: kind ที่ใช้ในเทสต์ข้างบนจำแนกได้ตรง (กันเทสต์ผ่านเพราะ URL ผิด)", () => {
+  const L = require("../../scripts/dlt/lib.js");
+  assert.equal(L.classifyDltUrl(REGISTER), "register");
+  assert.equal(L.classifyDltUrl("https://eservice.dlt.go.th/esvapp/esv/ebk/taxAgreement/index.jsf"), "agreement");
+  assert.equal(L.classifyDltUrl("https://eservice.dlt.go.th/esvapp/login.jsf"), "login");
+  assert.equal(L.classifyDltUrl("https://eservice.dlt.go.th/esvapp/esv/ebk/esv02i002/index.jsf"), "tax_form");
+});
+
+test("I-1: รอบ v2 ผ่าน prb_ok แล้ว หน้ายื่นภาษีโหลดใหม่ ⇒ ทำงานเหมือนเดิม (dispatch runTaxForm · ยังไม่ปิดรอบ)", async () => {
+  const { sw, store, calls } = boot();
+  await startV2(sw, "r1");
+  await waitingAddress(sw, "r1", 100);
+  await sw.dltOnTabComplete(100, "https://eservice.dlt.go.th/esvapp/esv/ebk/esv02i002/index.jsf");
+  assert.equal(store["dltRun:r1"].result, null);
+  assert.deepEqual(dispatchedSteps(calls).slice(-1), ["runTaxForm"]);
+});
+
+test("I-1: รอบ v2 ที่ยังไม่ผ่าน prb_ok โหลดหน้าลงทะเบียน ⇒ runRegister ตามเดิม", async () => {
+  const { sw, store, calls } = boot();
+  await startV2(sw, "r1");
+  await sw.dltOnTabComplete(100, REGISTER);
+  assert.equal(store["dltRun:r1"].result, null);
+  assert.deepEqual(dispatchedSteps(calls).slice(-1), ["runRegister"]);
+});
+
+test("final review m-8: รอบ v2 ผ่าน prb_ok แล้วไปหน้าที่ไม่รู้จัก ⇒ note มี pathname (เหมือน unexpected_page:<path>)", async () => {
+  const { sw, store } = boot();
+  await startV2(sw, "r1");
+  await waitingAddress(sw, "r1", 100);
+  await sw.dltOnTabComplete(100, "https://eservice.dlt.go.th/esvapp/esv/ebk/esv02q001/index.jsf?x=1");
+  const events = store["dltRun:r1"].timeline.map((t) => t.event);
+  assert.ok(events.includes("note:left_tax_form:unexpected:/esvapp/esv/ebk/esv02q001/index.jsf"), JSON.stringify(events));
+  assert.equal(store["dltRun:r1"].result.outcome, "ready_to_submit");
+  // kind ที่รู้จัก ⇒ note เดิม (ชนิดหน้า)
+  const b = boot();
+  await startV2(b.sw, "r2");
+  await waitingAddress(b.sw, "r2", 100);
+  await b.sw.dltOnTabComplete(100, REGISTER);
+  assert.ok(b.store["dltRun:r2"].timeline.some((t) => t.event === "note:left_tax_form:register"));
+});
